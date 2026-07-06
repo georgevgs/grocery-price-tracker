@@ -5,15 +5,17 @@ import type {
 import { RETAILER_LABELS } from '../lib/matching';
 import { PriceHistoryChart } from '../components/PriceHistoryChart';
 import { ProductImage } from '../components/ProductImage';
+import { ProductSettings } from '../components/ProductSettings';
 import { UpdateRetailersPanel } from '../components/UpdateRetailersPanel';
 import { bestListing, formatEuro, priceOf, sizeLabel } from '../lib/format';
 
 interface ProductViewProps {
   product: ProductWithListings;
   onGoResults: () => void;
+  onDeleted: () => void;
 }
 
-export const ProductView = ({ product, onGoResults }: ProductViewProps) => {
+export const ProductView = ({ product, onGoResults, onDeleted }: ProductViewProps) => {
   const best = bestListing(product.listings);
   const bestPrice = null !== best ? priceOf(best) : null;
   const size = sizeLabel(product);
@@ -83,6 +85,8 @@ export const ProductView = ({ product, onGoResults }: ProductViewProps) => {
             <div className="mb-1 font-mono text-xs tracking-wide">ΠΡΟΣΘΕΣΕ ΚΑΤΑΣΤΗΜΑΤΑ</div>
             <UpdateRetailersPanel product={product} />
           </div>
+
+          <ProductSettings product={product} onDeleted={onDeleted} />
         </div>
       </div>
     </section>

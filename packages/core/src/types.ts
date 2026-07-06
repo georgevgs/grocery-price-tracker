@@ -88,3 +88,17 @@ export interface CreateListingPayload {
   retailerSku: string;
   url: string;
 }
+
+/**
+ * Partial edit for an existing product — every field is optional so callers
+ * send only what changed. An omitted key is left untouched; an explicit
+ * `null` clears a nullable column. `brand`/`title` must stay non-empty.
+ */
+export interface UpdateProductPayload {
+  ean?: string | null;
+  brand?: string;
+  title?: string;
+  sizeValue?: number | null;
+  sizeUnit?: string | null;
+  imageUrl?: string | null;
+}

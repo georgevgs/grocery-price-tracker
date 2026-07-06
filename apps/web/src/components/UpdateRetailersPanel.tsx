@@ -9,6 +9,7 @@ import {
   updateProductEan,
 } from '../api/client';
 import { BarcodeScannerModal } from './BarcodeScannerModal';
+import { ErrorNotice } from './ErrorNotice';
 import { CandidateGroups } from './RetailerCandidates';
 import {
   collectConfirmedEan,
@@ -274,13 +275,11 @@ export const UpdateRetailersPanel = ({ product }: UpdateRetailersPanelProps) => 
         </button>
       </div>
 
-      {errors.map((error) => (
-        <p key={error} className="text-sm text-warn">
-          {error}
-        </p>
-      ))}
+      <ErrorNotice messages={errors} />
 
-      {null !== notice && <p className="text-sm font-medium text-ok">{notice}</p>}
+      {null !== notice && (
+        <p className="text-sm font-medium text-ok [overflow-wrap:anywhere]">{notice}</p>
+      )}
 
       {null !== candidates && (
         <>

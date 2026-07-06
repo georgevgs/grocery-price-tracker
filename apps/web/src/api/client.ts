@@ -4,6 +4,7 @@ import type {
   ProductWithListings,
   RetailerId,
   RetailerSearchResult,
+  UpdateProductPayload,
 } from '@grocery/core/types';
 
 export interface RetailerSearchResponse {
@@ -189,19 +190,56 @@ export const resolveProductUrl = async (
   return response.json();
 };
 
-export const updateProductEan = async (
+/**
+ * Partial edit of a product. Send only changed fields; the worker leaves
+ * omitted columns untouched. Surfaces the worker's error message (e.g. a
+ * duplicate-EAN conflict) so the UI can show something meaningful.
+ */
+export const updateProduct = async (
   productId: number,
-  ean: string | null,
+  patch: UpdateProductPayload,
 ): Promise<void> => {
   const response = await fetch(`/api/products/${productId}`, {
     method: 'PATCH',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ ean }),
+    body: JSON.stringify(patch),
   });
 
   if (false === response.ok) {
     const body = (await response.json().catch(() => null)) as { error?: string } | null;
     throw new Error(body?.error ?? `PATCH /api/products/${productId} failed: ${response.status}`);
+  }
+};
+
+export const updateProductEan = async (
+  productId: number,
+  ean: string | null,
+): Promise<void> => {
+  await updateProduct(productId, { ean });
+};
+
+export const deleteProduct = async (productId: number): Promise<void> => {
+  const response = await fetch(`/api/products/${productId}`, { method: 'DELETE' });
+
+  if (false === response.ok) {
+    const body = (await response.json().catch(() => null)) as { error?: string } | null;
+    throw new Error(body?.error ?? `DELETE /api/products/${productId} failed: ${response.status}`);
+  }
+};
+
+export const deleteListing = async (
+  productId: number,
+  listingId: number,
+): Promise<void> => {
+  const response = await fetch(`/api/products/${productId}/listings/${listingId}`, {
+    method: 'DELETE',
+  });
+
+  if (false === response.ok) {
+    const body = (await response.json().catch(() => null)) as { error?: string } | null;
+    throw new Error(
+      body?.error ?? `DELETE /api/products/${productId}/listings/${listingId} failed: ${response.status}`,
+    );
   }
 };
 

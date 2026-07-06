@@ -8,6 +8,7 @@ import type {
   ProductWithListings,
   RetailerId,
   RetailerSearchResult,
+  UpdateProductPayload,
 } from '@grocery/core/types';
 import { adapterRegistry } from '@grocery/scrapers/registry';
 import { runScrape, type Env } from './scrape';
@@ -68,6 +69,9 @@ app.get('/', (c) => {
       'GET /api/retailer-search?q=<title>',
       'GET /api/barcode/:ean',
       'POST /api/products',
+      'PATCH /api/products/:id',
+      'DELETE /api/products/:id',
+      'DELETE /api/products/:id/listings/:listingId',
       'POST /api/scrape/run',
     ],
   });
@@ -345,15 +349,76 @@ app.patch('/api/products/:id', async (c) => {
     return c.json({ error: 'invalid product id' }, 400);
   }
 
-  const payload = await c.req.json<{ ean: string | null }>();
+  const payload = await c.req.json<UpdateProductPayload>();
 
-  if (null !== payload.ean && ('string' !== typeof payload.ean || false === /^\d{8,14}$/.test(payload.ean))) {
-    return c.json({ error: 'ean must be 8-14 digits or null' }, 400);
+  // Build the SET clause from only the keys the caller actually sent, so a
+  // rename touches `title` without clobbering `ean`, and vice versa. An
+  // omitted key is left as-is; an explicit `null` clears a nullable column.
+  const columns: string[] = [];
+  const values: (string | number | null)[] = [];
+
+  if ('ean' in payload) {
+    if (null !== payload.ean && ('string' !== typeof payload.ean || false === /^\d{8,14}$/.test(payload.ean))) {
+      return c.json({ error: 'ean must be 8-14 digits or null' }, 400);
+    }
+
+    columns.push('ean = ?');
+    values.push(payload.ean);
+  }
+
+  if ('brand' in payload) {
+    if ('string' !== typeof payload.brand || 0 === payload.brand.trim().length) {
+      return c.json({ error: 'brand must be a non-empty string' }, 400);
+    }
+
+    columns.push('brand = ?');
+    values.push(payload.brand.trim());
+  }
+
+  if ('title' in payload) {
+    if ('string' !== typeof payload.title || 0 === payload.title.trim().length) {
+      return c.json({ error: 'title must be a non-empty string' }, 400);
+    }
+
+    columns.push('title = ?');
+    values.push(payload.title.trim());
+  }
+
+  if ('sizeValue' in payload) {
+    if (null !== payload.sizeValue && ('number' !== typeof payload.sizeValue || false === Number.isFinite(payload.sizeValue))) {
+      return c.json({ error: 'sizeValue must be a number or null' }, 400);
+    }
+
+    columns.push('size_value = ?');
+    values.push(payload.sizeValue);
+  }
+
+  if ('sizeUnit' in payload) {
+    if (null !== payload.sizeUnit && 'string' !== typeof payload.sizeUnit) {
+      return c.json({ error: 'sizeUnit must be a string or null' }, 400);
+    }
+
+    const unit = null === payload.sizeUnit ? null : payload.sizeUnit.trim();
+    columns.push('size_unit = ?');
+    values.push(null !== unit && 0 === unit.length ? null : unit);
+  }
+
+  if ('imageUrl' in payload) {
+    if (null !== payload.imageUrl && 'string' !== typeof payload.imageUrl) {
+      return c.json({ error: 'imageUrl must be a string or null' }, 400);
+    }
+
+    columns.push('image_url = ?');
+    values.push(payload.imageUrl);
+  }
+
+  if (0 === columns.length) {
+    return c.json({ error: 'no editable fields provided' }, 400);
   }
 
   try {
-    const result = await c.env.DB.prepare('UPDATE products SET ean = ? WHERE id = ?')
-      .bind(payload.ean, productId)
+    const result = await c.env.DB.prepare(`UPDATE products SET ${columns.join(', ')} WHERE id = ?`)
+      .bind(...values, productId)
       .run();
 
     if (0 === result.meta.changes) {
@@ -367,6 +432,64 @@ app.patch('/api/products/:id', async (c) => {
     }
 
     throw error;
+  }
+
+  return c.json({ ok: true });
+});
+
+/**
+ * Delete a product and everything hanging off it. The schema cascades
+ * (listings → product, price_history → listing), but we delete children
+ * first in an explicit batch so removal never depends on foreign-key
+ * enforcement being on for the connection.
+ */
+app.delete('/api/products/:id', async (c) => {
+  const productId = Number(c.req.param('id'));
+
+  if (Number.isNaN(productId)) {
+    return c.json({ error: 'invalid product id' }, 400);
+  }
+
+  const [, , productDelete] = await c.env.DB.batch([
+    c.env.DB.prepare(
+      'DELETE FROM price_history WHERE listing_id IN (SELECT id FROM retailer_listings WHERE product_id = ?)',
+    ).bind(productId),
+    c.env.DB.prepare('DELETE FROM retailer_listings WHERE product_id = ?').bind(productId),
+    c.env.DB.prepare('DELETE FROM products WHERE id = ?').bind(productId),
+  ]);
+
+  // The product delete is the last statement; no rows changed means it
+  // never existed.
+  if (undefined === productDelete || 0 === productDelete.meta.changes) {
+    return c.json({ error: `no product with id ${productId}` }, 404);
+  }
+
+  return c.json({ ok: true });
+});
+
+/**
+ * Unlink one store from a product — the fix for a wrong fuzzy match. Scoped
+ * to the product so a mismatched id can't delete a listing on another one;
+ * its price history goes with it.
+ */
+app.delete('/api/products/:id/listings/:listingId', async (c) => {
+  const productId = Number(c.req.param('id'));
+  const listingId = Number(c.req.param('listingId'));
+
+  if (Number.isNaN(productId) || Number.isNaN(listingId)) {
+    return c.json({ error: 'invalid product or listing id' }, 400);
+  }
+
+  const [, listingDelete] = await c.env.DB.batch([
+    c.env.DB.prepare('DELETE FROM price_history WHERE listing_id = ?').bind(listingId),
+    c.env.DB.prepare('DELETE FROM retailer_listings WHERE id = ? AND product_id = ?').bind(
+      listingId,
+      productId,
+    ),
+  ]);
+
+  if (undefined === listingDelete || 0 === listingDelete.meta.changes) {
+    return c.json({ error: `no listing ${listingId} on product ${productId}` }, 404);
   }
 
   return c.json({ ok: true });

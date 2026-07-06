@@ -98,6 +98,12 @@ export const App = () => {
     setView('home');
   };
 
+  const handleDeletedProduct = () => {
+    setSelectedProductId(null);
+    queryClient.invalidateQueries({ queryKey: ['products'] });
+    setView('home');
+  };
+
   return (
     <div className="flex min-h-screen flex-col bg-paper text-ink">
       <Header
@@ -133,6 +139,7 @@ export const App = () => {
           onGoHome: () => setView('home'),
           onGoResults: () => setView('results'),
           onCreated: handleCreated,
+          onDeletedProduct: handleDeletedProduct,
         })}
       </main>
 
@@ -164,6 +171,7 @@ interface RenderArgs {
   onGoHome: () => void;
   onGoResults: () => void;
   onCreated: () => void;
+  onDeletedProduct: () => void;
 }
 
 const renderView = (args: RenderArgs) => {
@@ -200,7 +208,13 @@ const renderView = (args: RenderArgs) => {
   }
 
   if ('product' === args.view && null !== args.selectedProduct) {
-    return <ProductView product={args.selectedProduct} onGoResults={args.onGoResults} />;
+    return (
+      <ProductView
+        product={args.selectedProduct}
+        onGoResults={args.onGoResults}
+        onDeleted={args.onDeletedProduct}
+      />
+    );
   }
 
   if ('results' === args.view || 'product' === args.view) {
