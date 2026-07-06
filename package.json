@@ -13,7 +13,8 @@
     "test": "tsx tests/run.ts",
     "db:migrate:local": "npm run db:migrate:local --workspace apps/worker",
     "db:migrate:remote": "npm run db:migrate:remote --workspace apps/worker",
-    "deploy": "npm run deploy --workspace apps/worker && npm run build --workspace apps/web"
+    "build": "npm run build --workspace apps/web",
+    "deploy": "npm run build --workspace apps/web && npm run deploy --workspace apps/worker"
   },
   "devDependencies": {
     "tsx": "^4.19.0",
