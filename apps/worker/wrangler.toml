@@ -9,9 +9,13 @@ compatibility_date = "2026-06-01"
 [assets]
 directory = "../web/dist"
 
-# Daily scrape at 05:15 UTC
-[triggers]
-crons = ["15 5 * * *"]
+# Daily scrape is now driven from a residential IP (scripts/scrape-local.ts via
+# launchd) because the retailers' bot protection blocks Cloudflare's Worker
+# egress (403/503). The edge cron is disabled so there's a single writer — no
+# race on price_history rows and no daily failure noise. Re-enable only if you
+# revert to edge scraping. Requires a redeploy to take effect.
+# [triggers]
+# crons = ["15 5 * * *"]
 
 [[d1_databases]]
 binding = "DB"

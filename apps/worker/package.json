@@ -6,6 +6,7 @@
   "scripts": {
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
+    "scrape:local": "tsx scripts/scrape-local.ts",
     "typecheck": "tsc -p tsconfig.json",
     "db:migrate:local": "wrangler d1 execute grocery-prices --local --file=./schema.sql",
     "db:migrate:remote": "wrangler d1 execute grocery-prices --remote --file=./schema.sql"

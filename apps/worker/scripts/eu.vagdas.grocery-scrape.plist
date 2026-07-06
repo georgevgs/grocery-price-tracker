@@ -1,0 +1,52 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>eu.vagdas.grocery-scrape</string>
+
+  <!-- Run npm DIRECTLY (it lives in /opt/homebrew, outside ~/Documents).
+       macOS won't let a launchd agent exec a file inside ~/Documents, but it
+       CAN read the repo there once the entry point is outside it. Adjust the
+       npm path if you move Node: `which npm`. -->
+  <key>ProgramArguments</key>
+  <array>
+    <string>/opt/homebrew/opt/node@24/bin/npm</string>
+    <string>run</string>
+    <string>scrape:local</string>
+    <string>--workspace</string>
+    <string>apps/worker</string>
+  </array>
+
+  <!-- The repo (reads here are allowed; only launchd's exec target must be outside). -->
+  <key>WorkingDirectory</key>
+  <string>/Users/gvagdas/Documents/Dev/grocery-price-tracker</string>
+
+  <!-- launchd hands jobs a bare PATH; Node/npx must be findable. -->
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/opt/homebrew/opt/node@24/bin:/usr/local/bin:/usr/bin:/bin</string>
+  </dict>
+
+  <!-- 08:15 Athens local — matches the old Cloudflare cron (05:15 UTC ≈ 08:15 EEST).
+       If the Mac is asleep at 08:15, launchd runs the missed job on next wake. -->
+  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Hour</key>
+    <integer>8</integer>
+    <key>Minute</key>
+    <integer>15</integer>
+  </dict>
+
+  <!-- Don't scrape on load/login; only on the schedule (or `launchctl start`). -->
+  <key>RunAtLoad</key>
+  <false/>
+
+  <!-- Log OUTSIDE ~/Documents — launchd may not be allowed to write there. -->
+  <key>StandardOutPath</key>
+  <string>/Users/gvagdas/Library/Logs/grocery-scrape.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/gvagdas/Library/Logs/grocery-scrape.log</string>
+</dict>
+</plist>
