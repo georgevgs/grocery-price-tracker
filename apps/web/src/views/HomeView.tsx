@@ -44,20 +44,23 @@ export const HomeView = ({
         {statusLine(products.length, retailerCount, isLoading, hasError)}
       </div>
 
-      <h1 className="m-0 mb-8 max-w-[16ch] text-[clamp(44px,8vw,92px)] font-bold leading-[0.94] tracking-[-0.03em]">
+      <h1 className="m-0 mb-5 max-w-[16ch] text-[clamp(30px,7vw,92px)] font-bold leading-[1.08] tracking-[-0.02em] md:mb-8 md:leading-[0.94] md:tracking-[-0.03em]">
         Βρες τη{' '}
-        <span className="rounded-[3px] bg-accent px-1.5 shadow-[0_0_0_2px_#0e0e0c]">
+        <span className="box-decoration-clone rounded-[3px] bg-accent px-1.5 shadow-[0_0_0_2px_#0e0e0c]">
           φθηνότερη
         </span>{' '}
         τιμή σε κάθε&nbsp;προϊόν.
       </h1>
 
-      <p className="m-0 mb-8 max-w-[54ch] text-[19px] leading-normal text-soft">
+      <p className="m-0 mb-6 max-w-[54ch] text-[16px] leading-normal text-soft md:mb-8 md:text-[19px]">
         Μία αναζήτηση σε όλα τα ελληνικά σούπερ μάρκετ που παρακολουθείς — ταξινομημένα
         ανά τιμή. Χωρίς εφαρμογές, χωρίς κάρτες, χωρίς περιττά.
       </p>
 
-      <div className="flex max-w-[640px] items-center gap-3 rounded-2xl border-[2.5px] border-ink bg-white py-3 pl-6 pr-3 shadow-hard">
+      {/* The sticky header already carries a search field on mobile — showing a
+          second one here just stacks two identical bars. Keep the big hero
+          search for md+ where the header search is one of several inline items. */}
+      <div className="hidden max-w-[640px] items-center gap-3 rounded-2xl border-[2.5px] border-ink bg-white py-3 pl-6 pr-3 shadow-hard md:flex">
         <svg
           width="22"
           height="22"
@@ -212,9 +215,9 @@ const ProductCard = ({ product, onSelect }: ProductCardProps) => {
           </div>
         }
       />
-      <div className="flex items-baseline justify-between gap-2 px-3.5 py-3">
-        <span className="line-clamp-2 text-[15px] font-semibold">{product.title}</span>
-        <span className="whitespace-nowrap font-mono text-[13px] font-bold">{priceLabel}</span>
+      <div className="flex flex-col gap-1 px-3.5 py-3">
+        <span className="line-clamp-2 text-[15px] font-semibold leading-snug">{product.title}</span>
+        <span className="font-mono text-[13px] font-bold text-soft">{priceLabel}</span>
       </div>
     </button>
   );
