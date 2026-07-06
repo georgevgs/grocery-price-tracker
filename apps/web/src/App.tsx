@@ -5,6 +5,7 @@ import { fetchProducts, triggerScrape } from './api/client';
 import { RETAILER_LABELS } from './lib/matching';
 import type { ResultSort, View } from './lib/format';
 import { Header } from './components/Header';
+import { BottomNav } from './components/BottomNav';
 import { Footer } from './components/Footer';
 import { AddProductForm } from './components/AddProductForm';
 import { HomeView } from './views/HomeView';
@@ -110,7 +111,7 @@ export const App = () => {
         isScraping={isScraping}
       />
 
-      <main className="mx-auto w-full max-w-[1180px] flex-1 px-5">
+      <main className="mx-auto w-full max-w-[1180px] flex-1 px-4 md:px-5">
         {renderView({
           view,
           products,
@@ -136,6 +137,8 @@ export const App = () => {
       </main>
 
       <Footer />
+
+      <BottomNav view={view} onNavigate={setView} onAdd={() => setView('add')} />
     </div>
   );
 };

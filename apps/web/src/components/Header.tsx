@@ -34,38 +34,58 @@ export const Header = ({
   };
 
   return (
-    <header className="sticky top-0 z-30 border-b-2 border-ink bg-paper">
-      <div className="mx-auto flex max-w-[1180px] flex-wrap items-center gap-4 px-5 py-3">
-        <button
-          type="button"
-          onClick={() => onNavigate('home')}
-          className="flex items-center gap-2 font-mono text-xl font-bold tracking-tight text-ink"
-        >
-          <span className="flex h-[26px] w-[26px] items-center justify-center rounded-[7px] border-2 border-ink bg-accent text-[15px] leading-none">
-            Τ
-          </span>
-          Τιμούλα
-        </button>
+    <header className="sticky top-0 z-30 border-b-2 border-ink bg-paper pt-safe-top">
+      <div className="mx-auto flex max-w-[1180px] flex-col gap-2.5 px-4 py-3 md:flex-row md:flex-nowrap md:items-center md:gap-4 md:px-5">
+        {/* Logo + refresh share one row on mobile; `md:contents` dissolves
+            this wrapper on desktop so both become cells of the header row. */}
+        <div className="flex items-center justify-between gap-3 md:contents">
+          <button
+            type="button"
+            onClick={() => onNavigate('home')}
+            className="flex flex-none items-center gap-2 font-mono text-xl font-bold tracking-tight text-ink"
+          >
+            <span className="flex h-[26px] w-[26px] items-center justify-center rounded-[7px] border-2 border-ink bg-accent text-[15px] leading-none">
+              Τ
+            </span>
+            Τιμούλα
+          </button>
 
-        <div className="flex min-w-[220px] flex-1 items-center gap-2.5 rounded-full border-2 border-ink bg-white py-2 pl-4 pr-2">
+          <button
+            type="button"
+            onClick={onScrape}
+            disabled={isScraping}
+            aria-label="Ανανέωση τιμών"
+            className="flex flex-none items-center gap-2 rounded-full border-2 border-ink bg-transparent px-3 py-2 font-mono text-[11px] font-bold tracking-wide text-ink disabled:opacity-60 md:order-last md:py-1.5"
+          >
+            <span
+              className={`h-2 w-2 rounded-full border-[1.5px] border-ink bg-accent ${
+                isScraping ? 'animate-blink' : ''
+              }`}
+            />
+            {isScraping ? 'ΑΝΑΝΕΩΣΗ…' : 'ΑΝΑΝΕΩΣΗ'}
+          </button>
+        </div>
+
+        <div className="flex min-w-0 flex-1 items-center gap-2.5 rounded-full border-2 border-ink bg-white py-2 pl-4 pr-2">
           <SearchIcon />
           <input
             value={query}
             onChange={(event) => onQueryChange(event.target.value)}
             onKeyDown={handleKey}
             placeholder="Ψάξε οποιοδήποτε προϊόν…"
-            className="min-w-[60px] flex-1 bg-transparent text-[15px] text-ink outline-none placeholder:text-muted"
+            className="min-w-0 flex-1 bg-transparent text-[15px] text-ink outline-none placeholder:text-muted"
           />
           <button
             type="button"
             onClick={onSubmitSearch}
-            className="rounded-full bg-ink px-4 py-2 font-mono text-xs font-bold tracking-widest text-white"
+            className="flex-none rounded-full bg-ink px-4 py-2 font-mono text-xs font-bold tracking-widest text-white"
           >
             ΨΑΞΕ
           </button>
         </div>
 
-        <nav className="flex gap-1.5">
+        {/* Tab navigation lives in the bottom bar on mobile (see BottomNav). */}
+        <nav className="hidden gap-1.5 md:flex">
           {TABS.map((tab) => (
             <button
               key={tab.view}
@@ -88,20 +108,6 @@ export const Header = ({
             + ΠΡΟΣΘΗΚΗ
           </button>
         </nav>
-
-        <button
-          type="button"
-          onClick={onScrape}
-          disabled={isScraping}
-          className="flex items-center gap-2 rounded-full border-2 border-ink bg-transparent px-3 py-1.5 font-mono text-[11px] font-bold tracking-wide text-ink disabled:opacity-60"
-        >
-          <span
-            className={`h-2 w-2 rounded-full border-[1.5px] border-ink bg-accent ${
-              isScraping ? 'animate-blink' : ''
-            }`}
-          />
-          {isScraping ? 'ΑΝΑΝΕΩΣΗ…' : 'ΑΝΑΝΕΩΣΗ'}
-        </button>
       </div>
     </header>
   );

@@ -23,6 +23,13 @@
   --shadow-hard-accent: 6px 6px 0 #ccff00;
   --shadow-pop: 4px 4px 0 #ccff00;
 
+  /* iOS/Android standalone insets — 0 in a browser tab, non-zero once
+     installed as a PWA. Exposed as spacing so `pt-safe`/`pb-safe` work. */
+  --spacing-safe-top: env(safe-area-inset-top);
+  --spacing-safe-bottom: env(safe-area-inset-bottom);
+  /* Height cleared by the fixed mobile tab bar (bar + bottom inset). */
+  --spacing-tabbar: calc(4rem + env(safe-area-inset-bottom));
+
   --animate-blink: blink 1s steps(1) infinite;
 
   @keyframes blink {
@@ -46,6 +53,11 @@ body {
   color: var(--color-ink);
   font-family: var(--font-sans);
   -webkit-font-smoothing: antialiased;
+  /* A single stray wide element shouldn't let the whole page pan sideways
+     on a phone — layouts opt into their own horizontal scroll instead.
+     `clip` (not `hidden`) avoids turning body into a scroll container,
+     which would break the sticky header. */
+  overflow-x: clip;
 }
 
 /* Diagonal-stripe placeholder fill used by product/category tiles. */

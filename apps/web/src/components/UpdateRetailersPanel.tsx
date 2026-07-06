@@ -231,9 +231,11 @@ export const UpdateRetailersPanel = ({ product }: UpdateRetailersPanelProps) => 
 
   return (
     <div className="flex flex-col gap-3">
-      <div className="flex gap-2">
+      {/* EAN + ΣΚΑΝ share the top row; the long search button drops to its
+          own full-width line on mobile and rejoins inline from `sm` up. */}
+      <div className="flex flex-wrap gap-2">
         <input
-          className="flex-1 rounded-xl border-2 border-ink bg-white px-3.5 py-2 text-sm outline-none placeholder:text-muted"
+          className="min-w-[55%] flex-1 rounded-xl border-2 border-ink bg-white px-3.5 py-2 text-sm outline-none placeholder:text-muted"
           placeholder="EAN (εντοπίζει το ακριβές προϊόν — σκάναρέ το)"
           value={ean}
           onChange={(event) => setEan(event.target.value)}
@@ -247,7 +249,7 @@ export const UpdateRetailersPanel = ({ product }: UpdateRetailersPanelProps) => 
         </button>
         <button
           type="button"
-          className="rounded-xl border-2 border-ink bg-white px-3 py-2 font-mono text-xs font-bold tracking-wide hover:bg-accent disabled:opacity-50"
+          className="w-full rounded-xl border-2 border-ink bg-white px-3 py-2 font-mono text-xs font-bold tracking-wide hover:bg-accent disabled:opacity-50 sm:w-auto"
           disabled={isSearching}
           onClick={handleSearch}
         >

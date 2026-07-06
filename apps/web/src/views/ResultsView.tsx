@@ -84,7 +84,7 @@ export const ResultsView = ({
             )}
           </p>
         </div>
-        <div className="flex gap-1.5">
+        <div className="flex flex-wrap gap-1.5">
           {SORTS.map((option) => (
             <button
               key={option.key}
@@ -100,8 +100,32 @@ export const ResultsView = ({
         </div>
       </div>
 
+      {/* Mobile store filter — a horizontal chip row instead of the desktop
+          sidebar, so it doesn't push results down the page. */}
+      {0 < catalogRetailers.length && (
+        <div className="-mx-4 mt-4 flex gap-2 overflow-x-auto px-4 pb-1 md:hidden">
+          {catalogRetailers.map((retailer) => {
+            const checked = selectedRetailers.has(retailer);
+
+            return (
+              <button
+                key={retailer}
+                type="button"
+                onClick={() => onToggleRetailer(retailer)}
+                aria-pressed={checked}
+                className={`flex-none rounded-full border-2 border-ink px-3.5 py-1.5 font-mono text-[11px] font-bold tracking-wide ${
+                  checked ? 'bg-accent' : 'bg-white'
+                }`}
+              >
+                {RETAILER_LABELS.get(retailer) ?? retailer}
+              </button>
+            );
+          })}
+        </div>
+      )}
+
       <div className="mt-6 grid grid-cols-1 items-start gap-6 md:grid-cols-[230px_1fr]">
-        <aside className="top-[86px] flex flex-col gap-4 md:sticky">
+        <aside className="top-[86px] hidden flex-col gap-4 md:sticky md:flex">
           <div className="rounded-2xl border-2 border-ink bg-white p-4">
             <div className="mb-3 font-mono text-[11px] tracking-wide">ΚΑΤΑΣΤΗΜΑΤΑ</div>
             {0 === catalogRetailers.length ? (
@@ -180,7 +204,7 @@ const ResultRowCard = ({ row, isCheapest, onSelect }: ResultRowCardProps) => {
     <button
       type="button"
       onClick={onSelect}
-      className={`relative grid grid-cols-[56px_1fr_auto] items-center gap-4 rounded-2xl border-2 border-ink bg-white px-[18px] py-4 text-left transition-transform hover:translate-x-[3px] ${
+      className={`relative grid grid-cols-[48px_1fr_auto] items-center gap-3 rounded-2xl border-2 border-ink bg-white px-3.5 py-4 text-left transition-transform hover:translate-x-[3px] sm:grid-cols-[56px_1fr_auto] sm:gap-4 sm:px-[18px] ${
         isCheapest ? 'shadow-pop' : ''
       }`}
     >
@@ -192,9 +216,9 @@ const ResultRowCard = ({ row, isCheapest, onSelect }: ResultRowCardProps) => {
       <ProductImage
         src={product.imageUrl}
         alt={product.title}
-        className="h-14 w-14 flex-none rounded-xl border-2 border-ink bg-white object-contain p-1"
+        className="h-12 w-12 flex-none rounded-xl border-2 border-ink bg-white object-contain p-1 sm:h-14 sm:w-14"
         fallback={
-          <span className="flex h-14 w-14 items-center justify-center rounded-xl border-2 border-ink bg-linen font-mono text-xl font-bold">
+          <span className="flex h-12 w-12 items-center justify-center rounded-xl border-2 border-ink bg-linen font-mono text-xl font-bold sm:h-14 sm:w-14">
             {productMark(product)}
           </span>
         }
@@ -214,7 +238,9 @@ const ResultRowCard = ({ row, isCheapest, onSelect }: ResultRowCardProps) => {
         </span>
       </span>
       <span className="flex flex-col items-end gap-1.5 text-right">
-        <span className="font-mono text-[26px] font-bold tracking-[-1px]">{priceLabel}</span>
+        <span className="font-mono text-[22px] font-bold tracking-[-1px] sm:text-[26px]">
+          {priceLabel}
+        </span>
         <span className="rounded-full border-[1.5px] border-ink px-2.5 py-1 font-mono text-[11px] tracking-wide">
           ΔΕΣ →
         </span>

@@ -38,7 +38,7 @@ export const HomeView = ({
   const trending = products.slice(0, MAX_TRENDING);
 
   return (
-    <section className="py-12">
+    <section className="py-8 md:py-12">
       <div className="mb-6 flex items-center gap-3 font-mono text-xs tracking-[0.15em] text-muted">
         <span className="inline-block h-0.5 w-8 bg-ink" />
         {statusLine(products.length, retailerCount, isLoading, hasError)}
@@ -168,7 +168,7 @@ const renderGrid = (
   }
 
   return (
-    <div className="mt-11 grid grid-cols-[repeat(auto-fill,minmax(180px,1fr))] gap-3.5">
+    <div className="mt-8 grid grid-cols-2 gap-3 sm:gap-3.5 md:mt-11 md:grid-cols-[repeat(auto-fill,minmax(180px,1fr))]">
       {products.map((product) => (
         <ProductCard
           key={product.id}
