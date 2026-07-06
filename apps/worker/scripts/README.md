@@ -1,7 +1,7 @@
 # Local price scrape (residential IP)
 
 The retailers' bot protection (Akamai on AB, a WAF on Sklavenitis, a CDN on
-Kritikos) blocks **Cloudflare's Worker egress IPs** — the deployed cron gets
+Kritikos) blocks **Cloudflare's Worker egress IPs** — the deployed cron got
 `403`/`503` from them. The identical requests succeed from a residential IP.
 
 So the daily scrape runs **here, on your Mac**, not on Cloudflare:
@@ -11,7 +11,6 @@ So the daily scrape runs **here, on your Mac**, not on Cloudflare:
   connection, and writes prices back to the remote D1. Reuses the Worker's
   adapters and its unit-price-sanity / failure helpers, so results match what
   the cron produced when it still worked.
-- `run-scrape.sh` — launchd wrapper (puts Node on `PATH`, then runs the script).
 - `eu.vagdas.grocery-scrape.plist` — launchd schedule (08:15 Athens, matching the
   old `05:15 UTC` cron).
 
@@ -28,9 +27,17 @@ npm run scrape:local --workspace apps/worker -- --dry-run # fetch only, print th
 
 ## Schedule it (launchd)
 
-1. Check the two paths at the top of `run-scrape.sh` match your machine:
-   - `NODE_BIN` = `dirname "$(which node)"`
-   - `REPO`     = this repo's absolute path
+The plist runs `npm` **directly** (from `/opt/homebrew`) rather than a wrapper
+script. That's deliberate: **macOS won't let a launchd agent execute a file
+inside `~/Documents`** (you get `exit 126: Operation not permitted`), but it
+*can* read the repo there once its exec entry point lives outside it. So the
+plist's `ProgramArguments[0]` is Node's `npm`, `WorkingDirectory` is the repo,
+and the log goes to `~/Library/Logs` (also outside `~/Documents`).
+
+1. Check the paths in the plist match your machine:
+   - `ProgramArguments[0]` = output of `which npm`
+   - `WorkingDirectory`    = this repo's absolute path
+   - `EnvironmentVariables > PATH` starts with `dirname "$(which npm)"`
 
 2. Symlink the plist into your user LaunchAgents and load it:
 
@@ -43,16 +50,17 @@ npm run scrape:local --workspace apps/worker -- --dry-run # fetch only, print th
 3. Verify / operate:
 
    ```bash
-   launchctl list | grep grocery-scrape          # is it registered?
+   launchctl list | grep grocery-scrape          # registered? (col 2 = last exit; 0 = ok)
    launchctl start eu.vagdas.grocery-scrape       # run once now
-   tail -f apps/worker/scripts/scrape.log         # watch output
+   tail -f ~/Library/Logs/grocery-scrape.log      # watch output
    launchctl unload ~/Library/LaunchAgents/eu.vagdas.grocery-scrape.plist  # stop
    ```
+
+   After editing the plist, `unload` then `load` again for changes to take effect.
 
 Notes:
 - If the Mac is asleep at 08:15, launchd runs the missed job on the next wake —
   fine for a daily tracker, but a laptop that's often closed will miss days. A
-  small always-on box (or `pmset` a wake) is the robust fix if that matters.
-- `scrape.log` is git-ignored.
+  small always-on box (or a `pmset` wake) is the robust fix if that matters.
 - After changing `wrangler.toml` (the disabled cron), redeploy for it to take
   effect: `npm run deploy`.

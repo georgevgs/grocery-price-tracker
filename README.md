@@ -10,7 +10,8 @@ developer docs.
 ## Stack
 
 - **Web**: Vite + React 19 + TypeScript + Tailwind v4, `vite-plugin-pwa` (Workbox), TanStack Query, Recharts
-- **API + cron scraper**: Cloudflare Worker (Hono) + D1, daily cron trigger
+- **API + host**: Cloudflare Worker (Hono) + D1; the same Worker also serves the built PWA (`apps/web/dist`) as static assets, so the site and `/api/*` share one origin
+- **Daily scrape**: a launchd job on a **residential IP** (`apps/worker/scripts/`) writes prices straight to the remote D1 — retailer WAFs block Cloudflare Worker egress, so the edge cron is disabled
 - **Shared**: `@grocery/core` (types, normalization, fuzzy matcher), `@grocery/scrapers` (adapter per retailer)
 
 ## Product identity model
@@ -52,13 +53,16 @@ npm run typecheck
 npm run deploy                                  # worker deploy + web build
 ```
 
-Serve `apps/web/dist` via Cloudflare Pages; route `/api/*` to the Worker (Pages Functions proxy or a route on your zone).
+`npm run deploy` builds the PWA to `apps/web/dist` and runs `wrangler deploy`;
+the Worker serves those static assets **and** handles `/api/*` from the same
+origin (see `[assets]` in `apps/worker/wrangler.toml`) — no separate Cloudflare
+Pages project or route needed.
 
-PWA icons: the Τιμούλα mark (bold «Τ» in ink on the accent field) ships in
-`apps/web/public/` — `pwa-192.png`, `pwa-512.png`, `pwa-maskable-512.png`,
-`apple-touch-icon.png`, `favicon.svg`. Regenerate them with
-`python3 apps/web/scripts/generate-icons.py` (needs Pillow); the Κ is drawn as
-geometry, so no font is required.
+Brand + PWA icons: the Τιμούλα logomark and handwritten wordmark live in
+`apps/web/src/components/BrandLogo.tsx` (used in the header and Home hero). The
+installed-app icons — `pwa-192.png`, `pwa-512.png`, `pwa-maskable-512.png`,
+`apple-touch-icon.png`, `favicon.svg` — ship in `apps/web/public/`; regenerate
+them with `python3 apps/web/scripts/generate-icons.py` (needs Pillow).
 
 ## Adding products
 
@@ -67,6 +71,12 @@ search live, results are ranked by `@grocery/core/match` (brand + size hard
 gates), the top match per retailer is preselected, and saving links the
 listings and scrapes today's prices immediately.
 (Kritikos search streams their full catalog — expect it to be the slow one.)
+
+**Editing & removing**: a product's own page has a collapsible edit panel to
+rename it (title/brand/size), unlink a store that was matched wrong, or delete
+the product entirely behind a two-tap confirm. Backed by `PATCH`/`DELETE
+/api/products/:id` and `DELETE /api/products/:id/listings/:listingId`; deletes
+cascade to price history.
 
 **Scan-to-prefill**: a barcode alone is enough — no title needed. Scanning
 (or pasting an EAN) resolves the product's name and brand from **Open Food
@@ -165,7 +175,7 @@ Each adapter implements `searchProducts(query)` (discovery) and
   survives this only because the remaining tokens carry the score; keep it in
   mind when match percentages look lower than expected.
 
-**WAF note**: retailers may block Cloudflare datacenter egress IPs. If the Worker cron gets 403s, keep the Worker as API + DB and push scrapes from a residential box via `POST /api/scrape/run`-style ingest (or reuse the standalone Python scraper posting rows).
+**WAF note**: retailers block Cloudflare datacenter egress IPs, so the Worker cron got 403/503s. This is already handled — the daily scrape runs off-edge from a residential IP (`apps/worker/scripts/scrape-local.ts` via launchd), reusing the Worker's adapters and writing straight to the remote D1, with the edge cron in `wrangler.toml` disabled. See `apps/worker/scripts/README.md` for the launchd setup.
 
 ## Alternative data source worth probing
 
