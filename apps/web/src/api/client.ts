@@ -82,16 +82,34 @@ export const lookupBarcode = async (ean: string): Promise<BarcodeInfo> => {
   }
 };
 
-export const searchRetailers = async (
+// Every retailer id, forced exhaustive against the RetailerId union: adding a
+// chain to the union makes this literal fail to compile until it's listed here
+// too, so the fan-out below can never silently skip a new chain.
+const RETAILER_PRESENCE: Record<RetailerId, true> = {
+  sklavenitis: true,
+  ab: true,
+  lidl: true,
+  masoutis: true,
+  mymarket: true,
+  kritikos: true,
+  galaxias: true,
+};
+
+const ALL_RETAILERS = Object.keys(RETAILER_PRESENCE) as RetailerId[];
+
+/**
+ * Search a single chain. One retailer per request is deliberate: the Worker
+ * parses each chain's catalog within the invocation, so fanning every chain
+ * out in one request blows the Workers free-plan per-request CPU budget
+ * (Cloudflare error 1102). One chain per request gives each its own budget
+ * and isolates a heavy/failing chain so it can't sink the whole search.
+ */
+const searchOneRetailer = async (
   query: string,
-  retailers?: readonly RetailerId[],
+  retailer: RetailerId,
   ean?: string | null,
 ): Promise<RetailerSearchResponse> => {
-  const params = new URLSearchParams({ q: query });
-
-  if (undefined !== retailers && 0 < retailers.length) {
-    params.set('retailers', retailers.join(','));
-  }
+  const params = new URLSearchParams({ q: query, retailers: retailer });
 
   if (null != ean && 0 < ean.length) {
     params.set('ean', ean);
@@ -100,10 +118,47 @@ export const searchRetailers = async (
   const response = await fetch(`/api/retailer-search?${params.toString()}`);
 
   if (false === response.ok) {
-    throw new Error(`GET /api/retailer-search failed: ${response.status}`);
+    // A chain over the CPU budget returns 5xx (1102). Surface it as that
+    // chain's error and let the others through instead of failing the search.
+    return { results: {}, errors: [`[${retailer}] search failed: HTTP ${response.status}`] };
   }
 
   return response.json();
+};
+
+/**
+ * Fan search out across chains, one request each, and merge. Signature and
+ * shape match a single combined call, so callers are unaffected; a subset
+ * (weak-chain retries, EAN passes) narrows the fan-out. Per-chain failures
+ * become entries in `errors` rather than throwing, so one bad chain never
+ * loses the rest.
+ */
+export const searchRetailers = async (
+  query: string,
+  retailers?: readonly RetailerId[],
+  ean?: string | null,
+): Promise<RetailerSearchResponse> => {
+  const targets = undefined !== retailers && 0 < retailers.length ? retailers : ALL_RETAILERS;
+
+  const responses = await Promise.all(
+    targets.map((retailer) =>
+      searchOneRetailer(query, retailer, ean).catch(
+        (error): RetailerSearchResponse => ({
+          results: {},
+          errors: [`[${retailer}] ${error instanceof Error ? error.message : String(error)}`],
+        }),
+      ),
+    ),
+  );
+
+  const merged: RetailerSearchResponse = { results: {}, errors: [] };
+
+  for (const response of responses) {
+    Object.assign(merged.results, response.results);
+    merged.errors.push(...response.errors);
+  }
+
+  return merged;
 };
 
 export interface ResolvedListing {
