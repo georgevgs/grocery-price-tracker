@@ -1,0 +1,518 @@
+import { Hono } from 'hono';
+import { cors } from 'hono/cors';
+import type {
+  CreateListingPayload,
+  CreateProductPayload,
+  ListingWithLatestPrice,
+  PricePoint,
+  ProductWithListings,
+  RetailerId,
+  RetailerSearchResult,
+} from '@grocery/core/types';
+import { adapterRegistry } from '@grocery/scrapers/registry';
+import { runScrape, type Env } from './scrape';
+import { lookupBarcode, type BarcodeInfo } from './openfoodfacts';
+
+interface ProductRow {
+  id: number;
+  ean: string | null;
+  brand: string;
+  title: string;
+  size_value: number | null;
+  size_unit: string | null;
+  image_url: string | null;
+}
+
+interface ListingLatestRow {
+  id: number;
+  product_id: number;
+  retailer: string;
+  retailer_sku: string;
+  url: string;
+  scraped_date: string | null;
+  price_piece: number | null;
+  price_unit: number | null;
+  unit_label: string | null;
+}
+
+interface HistoryRow {
+  listing_id: number;
+  retailer: string;
+  scraped_date: string;
+  price_piece: number | null;
+  price_unit: number | null;
+  unit_label: string | null;
+}
+
+interface BarcodeCacheRow {
+  name: string | null;
+  brand: string | null;
+  quantity: string | null;
+  image_url: string | null;
+  found: number;
+  is_fresh: number;
+}
+
+const app = new Hono<{ Bindings: Env }>();
+
+app.use('/api/*', cors());
+
+app.get('/', (c) => {
+  return c.json({
+    service: 'grocery-price-tracker-api',
+    hint: 'API only — the PWA runs on the Vite dev server (http://localhost:5173)',
+    endpoints: [
+      'GET /api/health',
+      'GET /api/products',
+      'GET /api/products/:id/history',
+      'GET /api/retailer-search?q=<title>',
+      'GET /api/barcode/:ean',
+      'POST /api/products',
+      'POST /api/scrape/run',
+    ],
+  });
+});
+
+app.get('/api/health', async (c) => {
+  try {
+    await c.env.DB.prepare('SELECT 1 FROM products LIMIT 1').run();
+    return c.json({ ok: true, db: 'migrated' });
+  } catch {
+    return c.json({ ok: false, db: 'missing tables — run: npm run db:migrate:local' }, 500);
+  }
+});
+
+app.get('/api/products', async (c) => {
+  const [productsResult, listingsResult] = await Promise.all([
+    c.env.DB.prepare('SELECT id, ean, brand, title, size_value, size_unit, image_url FROM products').all<ProductRow>(),
+    c.env.DB.prepare(
+      `SELECT l.id, l.product_id, l.retailer, l.retailer_sku, l.url,
+              ph.scraped_date, ph.price_piece, ph.price_unit, ph.unit_label
+       FROM retailer_listings l
+       LEFT JOIN price_history ph ON ph.listing_id = l.id
+         AND ph.scraped_date = (
+           SELECT MAX(scraped_date) FROM price_history WHERE listing_id = l.id
+         )`,
+    ).all<ListingLatestRow>(),
+  ]);
+
+  const listingsByProduct = groupListingsByProduct(listingsResult.results);
+
+  const products: ProductWithListings[] = productsResult.results.map((row) => {
+    const listings = listingsByProduct.get(row.id);
+
+    return {
+      id: row.id,
+      ean: row.ean,
+      brand: row.brand,
+      title: row.title,
+      sizeValue: row.size_value,
+      sizeUnit: row.size_unit,
+      imageUrl: row.image_url,
+      listings: listings ?? [],
+    };
+  });
+
+  return c.json(products);
+});
+
+app.get('/api/products/:id/history', async (c) => {
+  const productId = Number(c.req.param('id'));
+
+  if (Number.isNaN(productId)) {
+    return c.json({ error: 'invalid product id' }, 400);
+  }
+
+  const { results } = await c.env.DB.prepare(
+    `SELECT ph.listing_id, l.retailer, ph.scraped_date, ph.price_piece, ph.price_unit, ph.unit_label
+     FROM price_history ph
+     JOIN retailer_listings l ON l.id = ph.listing_id
+     WHERE l.product_id = ?
+     ORDER BY ph.scraped_date ASC`,
+  )
+    .bind(productId)
+    .all<HistoryRow>();
+
+  const history = results.map((row) => {
+    return {
+      listingId: row.listing_id,
+      retailer: row.retailer as RetailerId,
+      scrapedDate: row.scraped_date,
+      pricePiece: row.price_piece,
+      priceUnit: row.price_unit,
+      unitLabel: row.unit_label,
+    };
+  });
+
+  return c.json(history);
+});
+
+app.get('/api/retailer-search', async (c) => {
+  const query = c.req.query('q')?.trim() ?? '';
+
+  if (query.length < 3) {
+    return c.json({ error: 'q must be at least 3 characters' }, 400);
+  }
+
+  let adapters = [...adapterRegistry.values()];
+
+  // ?retailers=lidl,masoutis limits the fan-out — used when linking an
+  // existing product to only its not-yet-tracked chains.
+  const retailersParam = c.req.query('retailers')?.trim();
+
+  if (undefined !== retailersParam && 0 < retailersParam.length) {
+    const wanted = new Set(retailersParam.split(',').map((id) => id.trim()));
+    adapters = adapters.filter((adapter) => wanted.has(adapter.id));
+
+    if (0 === adapters.length) {
+      return c.json({ error: `no known retailers among "${retailersParam}"` }, 400);
+    }
+  }
+
+  const rawEan = c.req.query('ean')?.trim();
+  const hints = undefined !== rawEan && /^\d{8,14}$/.test(rawEan) ? { ean: rawEan } : undefined;
+
+  const outcomes = await Promise.allSettled(
+    adapters.map((adapter) => adapter.searchProducts(query, fetch, hints)),
+  );
+
+  const results: Partial<Record<RetailerId, RetailerSearchResult[]>> = {};
+  const errors: string[] = [];
+
+  outcomes.forEach((outcome, index) => {
+    const adapter = adapters[index];
+
+    if (undefined === adapter) {
+      return;
+    }
+
+    if ('fulfilled' === outcome.status) {
+      results[adapter.id] = outcome.value;
+    } else {
+      errors.push(outcome.reason instanceof Error ? outcome.reason.message : String(outcome.reason));
+    }
+  });
+
+  return c.json({ results, errors });
+});
+
+/**
+ * Resolve a scanned barcode to a product name/brand via Open Food Facts —
+ * the scan-to-prefill identity source, proxied here so we send a proper
+ * User-Agent and keep the client simple. Results are cached in D1
+ * (barcode_cache): product data is near-static, so each EAN hits OFF once
+ * and is served locally after. Returns nulls (never errors) when the
+ * barcode is unknown, so the web falls back to the retailer chains.
+ */
+app.get('/api/barcode/:ean', async (c) => {
+  const ean = c.req.param('ean');
+
+  if (false === /^\d{8,14}$/.test(ean)) {
+    return c.json({ error: 'ean must be 8-14 digits' }, 400);
+  }
+
+  const cached = await readBarcodeCache(c.env, ean);
+
+  if (null !== cached && 1 === cached.is_fresh) {
+    return c.json(cacheRowToInfo(cached));
+  }
+
+  const info = await lookupBarcode(ean, fetch);
+
+  // OFF gave no name this time — keep a previously cached name rather than
+  // clobbering it with an empty result (OFF may be transiently down, or the
+  // product simply isn't annotated yet). The stale row's short re-check
+  // window means we'll try OFF again on the next scan.
+  if (null === info.name && null !== cached && null !== cached.name) {
+    return c.json(cacheRowToInfo(cached));
+  }
+
+  await writeBarcodeCache(c.env, ean, info);
+  return c.json(info);
+});
+
+app.post('/api/products', async (c) => {
+  const payload = await c.req.json<CreateProductPayload>();
+
+  if ('string' !== typeof payload.brand || 0 === payload.brand.length) {
+    return c.json({ error: 'brand is required' }, 400);
+  }
+
+  if ('string' !== typeof payload.title || 0 === payload.title.length) {
+    return c.json({ error: 'title is required' }, 400);
+  }
+
+  const imageUrl = 'string' === typeof payload.imageUrl && 0 < payload.imageUrl.length ? payload.imageUrl : null;
+
+  const insertProduct = await c.env.DB.prepare(
+    'INSERT INTO products (ean, brand, title, size_value, size_unit, image_url) VALUES (?, ?, ?, ?, ?, ?)',
+  )
+    .bind(payload.ean, payload.brand, payload.title, payload.sizeValue, payload.sizeUnit, imageUrl)
+    .run();
+
+  const productId = insertProduct.meta.last_row_id;
+
+  if (0 < payload.listings.length) {
+    const statements = payload.listings.map((listing) => {
+      return c.env.DB.prepare(
+        'INSERT INTO retailer_listings (product_id, retailer, retailer_sku, url) VALUES (?, ?, ?, ?)',
+      ).bind(productId, listing.retailer, listing.retailerSku, listing.url);
+    });
+
+    await c.env.DB.batch(statements);
+  }
+
+  return c.json({ id: productId }, 201);
+});
+
+const RETAILER_HOSTS: ReadonlyArray<readonly [string, RetailerId]> = [
+  ['sklavenitis.gr', 'sklavenitis'],
+  ['ab.gr', 'ab'],
+  ['lidl-hellas.gr', 'lidl'],
+  ['masoutis.gr', 'masoutis'],
+  ['mymarket.gr', 'mymarket'],
+  ['kritikos-sm.gr', 'kritikos'],
+  ['galaxias.shop', 'galaxias'],
+];
+
+/**
+ * Resolve a pasted product-page URL into listing identity via the
+ * matching adapter — the escape hatch for products a chain's search
+ * index doesn't return (observed live on sklavenitis: the product page
+ * exists but no query surfaces it).
+ */
+app.post('/api/resolve-url', async (c) => {
+  const payload = await c.req.json<{ url: string; productTitle?: string }>();
+
+  if ('string' !== typeof payload.url) {
+    return c.json({ error: 'url is required' }, 400);
+  }
+
+  let parsed: URL;
+
+  try {
+    parsed = new URL(payload.url);
+  } catch {
+    return c.json({ error: 'not a valid URL' }, 400);
+  }
+
+  const host = parsed.hostname;
+  const entry = RETAILER_HOSTS.find(
+    ([suffix]) => host === suffix || host.endsWith(`.${suffix}`),
+  );
+
+  if (undefined === entry) {
+    return c.json({ error: `no adapter for host "${host}"` }, 400);
+  }
+
+  const adapter = adapterRegistry.get(entry[1]);
+
+  if (undefined === adapter) {
+    return c.json({ error: `no adapter for retailer "${entry[1]}"` }, 400);
+  }
+
+  parsed.hash = '';
+  const url = parsed.toString();
+
+  try {
+    const scraped = await adapter.scrapeProduct(url, fetch, {
+      productTitle: payload.productTitle,
+    });
+
+    if (null === scraped.sku) {
+      return c.json({ error: 'page did not expose a SKU' }, 422);
+    }
+
+    return c.json({
+      retailer: adapter.id,
+      sku: scraped.sku,
+      name: scraped.name,
+      url,
+      pricePiece: scraped.pricePiece,
+      priceUnit: scraped.priceUnit,
+      unitLabel: scraped.unitLabel,
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : 'scrape failed';
+    return c.json({ error: message }, 502);
+  }
+});
+
+app.patch('/api/products/:id', async (c) => {
+  const productId = Number(c.req.param('id'));
+
+  if (Number.isNaN(productId)) {
+    return c.json({ error: 'invalid product id' }, 400);
+  }
+
+  const payload = await c.req.json<{ ean: string | null }>();
+
+  if (null !== payload.ean && ('string' !== typeof payload.ean || false === /^\d{8,14}$/.test(payload.ean))) {
+    return c.json({ error: 'ean must be 8-14 digits or null' }, 400);
+  }
+
+  try {
+    const result = await c.env.DB.prepare('UPDATE products SET ean = ? WHERE id = ?')
+      .bind(payload.ean, productId)
+      .run();
+
+    if (0 === result.meta.changes) {
+      return c.json({ error: `no product with id ${productId}` }, 404);
+    }
+  } catch (error) {
+    // products.ean is UNIQUE — a duplicate means the barcode is already
+    // on another tracked product.
+    if (error instanceof Error && error.message.includes('UNIQUE')) {
+      return c.json({ error: 'another product already has this EAN' }, 409);
+    }
+
+    throw error;
+  }
+
+  return c.json({ ok: true });
+});
+
+app.post('/api/products/:id/listings', async (c) => {
+  const productId = Number(c.req.param('id'));
+
+  if (Number.isNaN(productId)) {
+    return c.json({ error: 'invalid product id' }, 400);
+  }
+
+  const payload = await c.req.json<{ listings: CreateListingPayload[] }>();
+
+  if (false === Array.isArray(payload.listings) || 0 === payload.listings.length) {
+    return c.json({ error: 'listings must be a non-empty array' }, 400);
+  }
+
+  for (const listing of payload.listings) {
+    if (
+      'string' !== typeof listing.retailer ||
+      'string' !== typeof listing.retailerSku ||
+      'string' !== typeof listing.url
+    ) {
+      return c.json({ error: 'each listing needs retailer, retailerSku and url' }, 400);
+    }
+  }
+
+  const product = await c.env.DB.prepare('SELECT id FROM products WHERE id = ?')
+    .bind(productId)
+    .first();
+
+  if (null === product) {
+    return c.json({ error: `no product with id ${productId}` }, 404);
+  }
+
+  // OR IGNORE: re-linking an already-tracked (retailer, sku) is a no-op,
+  // so the endpoint is safe to retry.
+  const statements = payload.listings.map((listing) => {
+    return c.env.DB.prepare(
+      'INSERT OR IGNORE INTO retailer_listings (product_id, retailer, retailer_sku, url) VALUES (?, ?, ?, ?)',
+    ).bind(productId, listing.retailer, listing.retailerSku, listing.url);
+  });
+
+  const outcomes = await c.env.DB.batch(statements);
+  const added = outcomes.reduce((sum, outcome) => sum + outcome.meta.changes, 0);
+
+  return c.json({ added }, 201);
+});
+
+app.post('/api/scrape/run', async (c) => {
+  const result = await runScrape(c.env);
+  return c.json(result);
+});
+
+const cacheRowToInfo = (row: BarcodeCacheRow): BarcodeInfo => {
+  return {
+    name: row.name,
+    brand: row.brand,
+    quantity: row.quantity,
+    imageUrl: row.image_url,
+  };
+};
+
+/**
+ * A row is fresh while within its re-check window: a resolved name lasts
+ * 90 days (product data barely changes); a miss/stub only 14, so a barcode
+ * that later gets annotated on OFF gets picked up on a subsequent scan.
+ */
+const readBarcodeCache = async (env: Env, ean: string): Promise<BarcodeCacheRow | null> => {
+  const row = await env.DB.prepare(
+    `SELECT name, brand, quantity, image_url, found,
+            (cached_at > datetime('now', CASE WHEN found = 1 THEN '-90 days' ELSE '-14 days' END)) AS is_fresh
+     FROM barcode_cache
+     WHERE ean = ?`,
+  )
+    .bind(ean)
+    .first<BarcodeCacheRow>();
+
+  return row ?? null;
+};
+
+const writeBarcodeCache = async (env: Env, ean: string, info: BarcodeInfo): Promise<void> => {
+  await env.DB.prepare(
+    `INSERT OR REPLACE INTO barcode_cache
+       (ean, name, brand, quantity, image_url, source, found, cached_at)
+     VALUES (?, ?, ?, ?, ?, 'openfoodfacts', ?, datetime('now'))`,
+  )
+    .bind(ean, info.name, info.brand, info.quantity, info.imageUrl, null !== info.name ? 1 : 0)
+    .run();
+};
+
+const groupListingsByProduct = (
+  rows: readonly ListingLatestRow[],
+): Map<number, ListingWithLatestPrice[]> => {
+  const grouped = new Map<number, ListingWithLatestPrice[]>();
+
+  for (const row of rows) {
+    const listing: ListingWithLatestPrice = {
+      id: row.id,
+      productId: row.product_id,
+      retailer: row.retailer as RetailerId,
+      retailerSku: row.retailer_sku,
+      url: row.url,
+      latestPrice: toPricePoint(row),
+    };
+
+    const existing = grouped.get(row.product_id);
+
+    if (undefined === existing) {
+      grouped.set(row.product_id, [listing]);
+    } else {
+      existing.push(listing);
+    }
+  }
+
+  return grouped;
+};
+
+const toPricePoint = (row: ListingLatestRow): PricePoint | null => {
+  if (null === row.scraped_date) {
+    return null;
+  }
+
+  return {
+    listingId: row.id,
+    scrapedDate: row.scraped_date,
+    pricePiece: row.price_piece,
+    priceUnit: row.price_unit,
+    unitLabel: row.unit_label,
+  };
+};
+
+export default {
+  fetch: app.fetch,
+
+  async scheduled(_event: ScheduledEvent, env: Env, ctx: ExecutionContext): Promise<void> {
+    ctx.waitUntil(logScrapeRun(env));
+  },
+};
+
+const logScrapeRun = async (env: Env): Promise<void> => {
+  const result = await runScrape(env);
+  console.log(
+    `scrape complete: ${result.ok} ok, ${result.failed} failed, ${result.warnings.length} suspect`,
+    result.errors,
+    result.warnings,
+  );
+};

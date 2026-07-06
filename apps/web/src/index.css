@@ -1,0 +1,58 @@
+@import 'tailwindcss';
+
+@theme {
+  --font-sans: 'Space Grotesk', system-ui, sans-serif;
+  --font-mono: 'Space Mono', ui-monospace, monospace;
+
+  --color-paper: #efefea;
+  --color-ink: #0e0e0c;
+  --color-accent: #ccff00;
+  --color-muted: #6b6b63;
+  --color-soft: #3a3a34;
+  --color-faint: #8a8a80;
+  --color-linen: #f3f3ee;
+  --color-hatch: #e7e7e1;
+  --color-hairline: #c9c9c0;
+  --color-rowline: #e4e4dc;
+  --color-ok: #1f9e55;
+  --color-danger: #cc3333;
+  --color-warn: #a16207;
+
+  --shadow-hard: 6px 6px 0 #0e0e0c;
+  --shadow-hard-sm: 2px 2px 0 #0e0e0c;
+  --shadow-hard-accent: 6px 6px 0 #ccff00;
+  --shadow-pop: 4px 4px 0 #ccff00;
+
+  --animate-blink: blink 1s steps(1) infinite;
+
+  @keyframes blink {
+    0%,
+    100% {
+      opacity: 1;
+    }
+    50% {
+      opacity: 0.25;
+    }
+  }
+}
+
+::selection {
+  background: var(--color-accent);
+  color: var(--color-ink);
+}
+
+body {
+  background: var(--color-paper);
+  color: var(--color-ink);
+  font-family: var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+}
+
+/* Diagonal-stripe placeholder fill used by product/category tiles. */
+.hatch {
+  background-image: repeating-linear-gradient(
+    135deg,
+    var(--color-hatch) 0 10px,
+    var(--color-paper) 10px 20px
+  );
+}

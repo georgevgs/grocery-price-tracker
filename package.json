@@ -1,0 +1,22 @@
+{
+  "name": "grocery-price-tracker",
+  "private": true,
+  "type": "module",
+  "workspaces": [
+    "packages/*",
+    "apps/*"
+  ],
+  "scripts": {
+    "dev:web": "npm run dev --workspace apps/web",
+    "dev:worker": "npm run dev --workspace apps/worker",
+    "typecheck": "npm run typecheck --workspaces --if-present",
+    "test": "tsx tests/run.ts",
+    "db:migrate:local": "npm run db:migrate:local --workspace apps/worker",
+    "db:migrate:remote": "npm run db:migrate:remote --workspace apps/worker",
+    "deploy": "npm run deploy --workspace apps/worker && npm run build --workspace apps/web"
+  },
+  "devDependencies": {
+    "tsx": "^4.19.0",
+    "typescript": "^5.6.0"
+  }
+}

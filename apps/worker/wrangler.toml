@@ -1,0 +1,19 @@
+name = "grocery-price-tracker-api"
+main = "src/index.ts"
+compatibility_date = "2026-06-01"
+
+# Serve the built Vite PWA (apps/web/dist) as static assets from this same
+# Worker, so the site and the /api/* backend share one origin (and the web's
+# relative /api calls just work). Assets are matched first; any path with no
+# matching file (i.e. /api/*) falls through to the Worker below.
+[assets]
+directory = "../web/dist"
+
+# Daily scrape at 05:15 UTC
+[triggers]
+crons = ["15 5 * * *"]
+
+[[d1_databases]]
+binding = "DB"
+database_name = "grocery-prices"
+database_id = "790a2365-b5fe-44c9-91fa-cd383f1daa96"

@@ -1,0 +1,22 @@
+{
+  "name": "@grocery/worker",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "typecheck": "tsc -p tsconfig.json",
+    "db:migrate:local": "wrangler d1 execute grocery-prices --local --file=./schema.sql",
+    "db:migrate:remote": "wrangler d1 execute grocery-prices --remote --file=./schema.sql"
+  },
+  "dependencies": {
+    "@grocery/core": "*",
+    "@grocery/scrapers": "*",
+    "hono": "^4.6.0"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20241127.0",
+    "wrangler": "^3.90.0"
+  }
+}
