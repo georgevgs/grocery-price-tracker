@@ -1,5 +1,6 @@
 import type { KeyboardEvent } from 'react';
 import type { View } from '../lib/format';
+import { Logomark, Wordmark } from './BrandLogo';
 
 interface HeaderProps {
   view: View;
@@ -42,12 +43,11 @@ export const Header = ({
           <button
             type="button"
             onClick={() => onNavigate('home')}
-            className="flex flex-none items-center gap-2 font-mono text-xl font-bold tracking-tight text-ink"
+            aria-label="Τιμούλα — αρχική"
+            className="flex flex-none items-center gap-2 text-ink"
           >
-            <span className="flex h-[26px] w-[26px] items-center justify-center rounded-[7px] border-2 border-ink bg-accent text-[15px] leading-none">
-              Τ
-            </span>
-            Τιμούλα
+            <Logomark className="h-[26px] w-[26px]" />
+            <Wordmark className="h-[22px] w-auto" />
           </button>
 
           <button

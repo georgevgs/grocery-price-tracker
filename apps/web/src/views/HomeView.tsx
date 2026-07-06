@@ -2,6 +2,7 @@ import type { KeyboardEvent } from 'react';
 import type { ProductWithListings } from '@grocery/core/types';
 import { bestListing, formatEuro } from '../lib/format';
 import { ProductImage } from '../components/ProductImage';
+import { Wordmark } from '../components/BrandLogo';
 
 interface HomeViewProps {
   products: ProductWithListings[];
@@ -39,6 +40,13 @@ export const HomeView = ({
 
   return (
     <section className="py-8 md:py-12">
+      {/* Handwritten brand kicker — the wordmark's one big, warm moment,
+          carrying the signature lime marker underline above the value prop. */}
+      <Wordmark
+        underline
+        className="mb-4 h-[clamp(2.5rem,9vw,3.5rem)] w-auto text-ink md:mb-5"
+      />
+
       <div className="mb-6 flex items-center gap-3 font-mono text-xs tracking-[0.15em] text-muted">
         <span className="inline-block h-0.5 w-8 bg-ink" />
         {statusLine(products.length, retailerCount, isLoading, hasError)}
