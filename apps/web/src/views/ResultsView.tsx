@@ -8,7 +8,9 @@ import { ProductImage } from '../components/ProductImage';
 import {
   bestListing,
   formatEuro,
+  freshnessLabel,
   matchesQuery,
+  priceFreshness,
   priceRange,
   productMark,
   sizeLabel,
@@ -199,6 +201,8 @@ const ResultRowCard = ({ row, isCheapest, onSelect }: ResultRowCardProps) => {
 
   const bestRetailer =
     null !== best ? (RETAILER_LABELS.get(best.retailer) ?? best.retailer) : null;
+  const fresh = null !== best ? priceFreshness(best) : null;
+  const freshText = null !== fresh ? freshnessLabel(fresh) : null;
 
   return (
     <button
@@ -241,6 +245,13 @@ const ResultRowCard = ({ row, isCheapest, onSelect }: ResultRowCardProps) => {
         <span className="font-mono text-[22px] font-bold tracking-[-1px] sm:text-[26px]">
           {priceLabel}
         </span>
+        {null !== freshText && (
+          <span
+            className={`font-mono text-[10px] ${null !== fresh && fresh.isStale ? 'text-warn' : 'text-faint'}`}
+          >
+            {null !== fresh && fresh.isStale ? `⚠ ${freshText}` : freshText}
+          </span>
+        )}
         <span className="rounded-full border-[1.5px] border-ink px-2.5 py-1 font-mono text-[11px] tracking-wide">
           ΔΕΣ →
         </span>
@@ -288,7 +299,7 @@ const sortRows = (rows: ResultRow[], sort: ResultSort): ResultRow[] => {
 
   return rows.slice().sort((a, b) => {
     if ('name' === sort) {
-      return a.product.title.localeCompare(b.product.title);
+      return a.product.title.localeCompare(b.product.title, 'el');
     }
 
     if ('saving' === sort) {

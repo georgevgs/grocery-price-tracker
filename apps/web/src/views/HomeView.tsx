@@ -1,6 +1,6 @@
 import type { KeyboardEvent } from 'react';
 import type { ProductWithListings } from '@grocery/core/types';
-import { bestListing, formatEuro } from '../lib/format';
+import { bestListing, formatEuro, freshnessLabel, priceFreshness } from '../lib/format';
 import { ProductImage } from '../components/ProductImage';
 import { Wordmark } from '../components/BrandLogo';
 
@@ -99,7 +99,7 @@ export const HomeView = ({
 
       {0 < trending.length && (
         <div className="mt-5 flex flex-wrap items-center gap-2.5">
-          <span className="font-mono text-[11px] tracking-wide text-muted">ΔΗΜΟΦΙΛΗ</span>
+          <span className="font-mono text-[11px] tracking-wide text-muted">ΠΑΡΑΚΟΛΟΥΘΕΙΣ</span>
           {trending.map((product) => (
             <button
               key={product.id}
@@ -198,6 +198,8 @@ interface ProductCardProps {
 
 const ProductCard = ({ product, onSelect }: ProductCardProps) => {
   const best = bestListing(product.listings);
+  const fresh = null !== best ? priceFreshness(best) : null;
+  const freshText = null !== fresh ? freshnessLabel(fresh) : null;
 
   let priceLabel = 'χωρίς τιμή ακόμα';
 
@@ -226,6 +228,13 @@ const ProductCard = ({ product, onSelect }: ProductCardProps) => {
       <div className="flex flex-col gap-1 px-3.5 py-3">
         <span className="line-clamp-2 text-[15px] font-semibold leading-snug">{product.title}</span>
         <span className="font-mono text-[13px] font-bold text-soft">{priceLabel}</span>
+        {null !== freshText && (
+          <span
+            className={`font-mono text-[10px] ${null !== fresh && fresh.isStale ? 'text-warn' : 'text-faint'}`}
+          >
+            {null !== fresh && fresh.isStale ? `⚠ ${freshText}` : freshText}
+          </span>
+        )}
       </div>
     </button>
   );

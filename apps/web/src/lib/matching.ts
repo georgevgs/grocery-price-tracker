@@ -27,6 +27,17 @@ export const SUGGESTION_THRESHOLD = 0.45;
 /** A match this strong that carries a barcode is trusted as the product's identity. */
 export const EAN_DISCOVERY_THRESHOLD = 0.6;
 
+/**
+ * Only PRE-SELECT a chain's top candidate when it scores at least this AND its
+ * size is verified. SUGGESTION_THRESHOLD (0.45) sits at the lookalike ceiling,
+ * so auto-picking there blind-links bad matches; genuine cross-retailer pairs
+ * score ≥0.8. Weaker or size-unverified matches still show, but unchecked, so
+ * the human consciously confirms them — the "suggester, never auto-linker"
+ * principle the whole identity model rests on. An EAN-exact match scores 1 with
+ * sizeUnverified=false, so barcode identity is always pre-selected.
+ */
+export const AUTO_PICK_THRESHOLD = 0.8;
+
 /** Chains whose backends resolve barcodes (see SearchHints in @grocery/scrapers). */
 const EAN_CAPABLE_RETAILERS: ReadonlySet<RetailerId> = new Set<RetailerId>([
   'galaxias',

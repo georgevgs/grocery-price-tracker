@@ -28,7 +28,15 @@ const EAN_FORMATS = ['ean_13', 'ean_8'];
  */
 export const BarcodeScannerModal = ({ isOpen, onDetected, onClose }: BarcodeScannerModalProps) => {
   const videoRef = useRef<HTMLVideoElement | null>(null);
+  const dialogRef = useRef<HTMLDivElement | null>(null);
   const [scanError, setScanError] = useState<string | null>(null);
+  // Latest callbacks held in refs so the camera effect can depend on [isOpen]
+  // alone — the parents pass fresh inline handlers every render, and keying the
+  // effect on them tore down and re-created getUserMedia on each keystroke.
+  const onDetectedRef = useRef(onDetected);
+  onDetectedRef.current = onDetected;
+  const onCloseRef = useRef(onClose);
+  onCloseRef.current = onClose;
 
   useEffect(() => {
     if (false === isOpen) {
@@ -37,12 +45,36 @@ export const BarcodeScannerModal = ({ isOpen, onDetected, onClose }: BarcodeScan
 
     const controller = new AbortController();
 
-    startScanning(videoRef.current, controller.signal, onDetected, setScanError);
+    startScanning(
+      videoRef.current,
+      controller.signal,
+      (ean) => onDetectedRef.current(ean),
+      setScanError,
+    );
 
     return () => {
       controller.abort();
     };
-  }, [isOpen, onDetected]);
+  }, [isOpen]);
+
+  // Accessible-dialog basics: focus the dialog on open, close on Escape.
+  useEffect(() => {
+    if (false === isOpen) {
+      return;
+    }
+
+    dialogRef.current?.focus();
+
+    const onKey = (event: KeyboardEvent) => {
+      if ('Escape' === event.key) {
+        onCloseRef.current();
+      }
+    };
+
+    window.addEventListener('keydown', onKey);
+
+    return () => window.removeEventListener('keydown', onKey);
+  }, [isOpen]);
 
   if (false === isOpen) {
     return null;
@@ -55,10 +87,23 @@ export const BarcodeScannerModal = ({ isOpen, onDetected, onClose }: BarcodeScan
   }
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-ink/70 p-4">
-      <div className="w-full max-w-sm rounded-2xl border-2 border-ink bg-paper p-4 shadow-hard">
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center bg-ink/70 p-4"
+      onClick={onClose}
+    >
+      <div
+        ref={dialogRef}
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="scanner-title"
+        tabIndex={-1}
+        className="w-full max-w-sm rounded-2xl border-2 border-ink bg-paper p-4 shadow-hard outline-none"
+        onClick={(event) => event.stopPropagation()}
+      >
         <div className="flex items-center justify-between">
-          <h2 className="font-mono text-xs font-bold tracking-wide">ΣΑΡΩΣΗ BARCODE</h2>
+          <h2 id="scanner-title" className="font-mono text-xs font-bold tracking-wide">
+            ΣΑΡΩΣΗ BARCODE
+          </h2>
           <button
             type="button"
             className="rounded-full border-2 border-ink px-2.5 py-1 font-mono text-[11px] font-bold tracking-wide hover:bg-accent"
@@ -174,6 +219,15 @@ const scanWithZxing = async (
 ): Promise<void> => {
   try {
     const { BrowserMultiFormatReader } = await import('@zxing/browser');
+
+    // The modal may have closed during the dynamic import / decode setup —
+    // bail (and stop) so the zxing decode loop and its camera track don't leak.
+    // aborted() is read through a helper so TS re-evaluates it after each await
+    // instead of narrowing it to a stale literal from the first check.
+    if (true === aborted(signal)) {
+      return;
+    }
+
     const reader = new BrowserMultiFormatReader();
 
     const controls = await reader.decodeFromVideoElement(video, (result) => {
@@ -183,6 +237,11 @@ const scanWithZxing = async (
       }
     });
 
+    if (true === aborted(signal)) {
+      controls.stop();
+      return;
+    }
+
     signal.addEventListener('abort', () => {
       controls.stop();
     });
@@ -190,6 +249,9 @@ const scanWithZxing = async (
     onError('Η σάρωση barcode δεν υποστηρίζεται σε αυτόν τον browser.');
   }
 };
+
+/** Read AbortSignal.aborted through a call so TS doesn't narrow it across awaits. */
+const aborted = (signal: AbortSignal): boolean => signal.aborted;
 
 const stopStream = (stream: MediaStream): void => {
   for (const track of stream.getTracks()) {

@@ -1,5 +1,6 @@
 import type { RetailerId } from '@grocery/core/types';
 import { RETAILER_LABELS, type RankedResult } from '../lib/matching';
+import { formatEuro } from '../lib/format';
 
 interface CandidateGroupsProps {
   candidates: Map<RetailerId, RankedResult[]>;
@@ -33,7 +34,7 @@ export const CandidateGroups = ({ candidates, selectedSkus, onSelect }: Candidat
                     {result.title}
                     {null !== result.pricePiece && (
                       <span className="ml-1 font-mono font-bold text-ink">
-                        {result.pricePiece.toFixed(2).replace('.', ',')} €
+                        {formatEuro(result.pricePiece)}
                       </span>
                     )}
                     {null !== score && (

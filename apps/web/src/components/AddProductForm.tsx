@@ -8,6 +8,7 @@ import { ErrorNotice } from './ErrorNotice';
 import { CandidateGroups } from './RetailerCandidates';
 import { SearchProgressBoard, useSearchProgress } from './SearchProgressBoard';
 import {
+  AUTO_PICK_THRESHOLD,
   collectConfirmedEan,
   collectProductImage,
   collectSelectedListings,
@@ -105,7 +106,7 @@ export const AddProductForm = ({ existingProducts, onCreated }: AddProductFormPr
         return;
       }
 
-      const { ranked, errors, discoveredEan } = await searchAndRank(
+      const { ranked, errors } = await searchAndRank(
         effectiveTitle,
         effectiveBrand,
         scanned,
@@ -120,21 +121,25 @@ export const AddProductForm = ({ existingProducts, onCreated }: AddProductFormPr
         const top = list.slice(0, MAX_CANDIDATES);
         sliced.set(retailer, top);
 
+        // Only pre-select a confident, size-verified top match; weaker or
+        // size-unverified ones stay visible but unchecked so the user
+        // consciously confirms them rather than blind-linking a lookalike.
         const best = top[0];
         const autoPick =
-          undefined !== best && null !== best.score && SUGGESTION_THRESHOLD <= best.score
+          undefined !== best &&
+          null !== best.score &&
+          AUTO_PICK_THRESHOLD <= best.score &&
+          false === best.sizeUnverified
             ? best.result.sku
             : null;
         preselected.set(retailer, autoPick);
       }
 
-      // A barcode discovered from a strong match fills the EAN field, so
-      // saving the product stores it. (Guard on the override too — after a
-      // scan the `ean` state hasn't re-rendered yet, so reading it here
-      // would look empty and clobber the just-scanned barcode.)
-      if (null !== discoveredEan && 0 === (eanOverride ?? ean).trim().length) {
-        setEan(discoveredEan);
-      }
+      // NOTE: a barcode discovered from a single fuzzy match is deliberately
+      // NOT written into the EAN field here — that would persist an unverified
+      // identity from one ≥0.6 guess. The EAN is instead taken at save time
+      // from what the user typed/scanned, or from collectConfirmedEan (which
+      // requires the confirmed picks to AGREE on a barcode).
 
       setCandidates(sliced);
       setSelectedSkus(preselected);
@@ -268,15 +273,28 @@ export const AddProductForm = ({ existingProducts, onCreated }: AddProductFormPr
 
       {true === isSearching && <SearchProgressBoard progress={progress} />}
 
-      <ErrorNotice messages={searchErrors} tone="warn" />
+      {/* When NOTHING was found, the per-chain errors are the whole story, so
+          show them as a real failure (red), not an amber "hiccup". */}
+      <ErrorNotice
+        messages={searchErrors}
+        tone={null !== candidates && 0 === countCandidates(candidates) ? 'danger' : 'warn'}
+      />
 
-      {null !== candidates && (
-        <CandidateGroups
-          candidates={candidates}
-          selectedSkus={selectedSkus}
-          onSelect={handleSelect}
-        />
-      )}
+      {null !== candidates &&
+        (0 === countCandidates(candidates) ? (
+          <p className="rounded-xl border-2 border-dashed border-ink bg-white px-3.5 py-3 text-sm text-muted">
+            Δεν βρέθηκαν αντιστοιχίες σε κανένα κατάστημα
+            {0 < searchErrors.length
+              ? ' — δες τα σφάλματα πιο πάνω.'
+              : '. Δοκίμασε διαφορετικό τίτλο ή σκάναρε το barcode.'}
+          </p>
+        ) : (
+          <CandidateGroups
+            candidates={candidates}
+            selectedSkus={selectedSkus}
+            onSelect={handleSelect}
+          />
+        ))}
 
       {errorBlock}
 
@@ -295,6 +313,16 @@ export const AddProductForm = ({ existingProducts, onCreated }: AddProductFormPr
       />
     </form>
   );
+};
+
+const countCandidates = (candidates: Map<RetailerId, RankedResult[]>): number => {
+  let total = 0;
+
+  for (const list of candidates.values()) {
+    total += list.length;
+  }
+
+  return total;
 };
 
 const computeSuggestions = (

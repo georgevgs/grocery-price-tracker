@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import type { ProductWithListings, RetailerId } from '@grocery/core/types';
 import { fetchProducts, triggerScrape } from './api/client';
@@ -13,11 +13,56 @@ import { ResultsView } from './views/ResultsView';
 import { ProductView } from './views/ProductView';
 import { StoresView } from './views/StoresView';
 
+/** Navigational state → location.hash. Home is '#/'; query/sort/filters are not encoded. */
+const stateToHash = (view: View, productId: number | null): string => {
+  if ('product' === view && null !== productId) {
+    return `#/product/${productId}`;
+  }
+
+  if ('results' === view) {
+    return '#/results';
+  }
+
+  if ('stores' === view) {
+    return '#/stores';
+  }
+
+  if ('add' === view) {
+    return '#/add';
+  }
+
+  return '#/';
+};
+
+const hashToState = (hash: string): { view: View; productId: number | null } => {
+  const productMatch = hash.match(/^#\/product\/(\d+)$/);
+
+  if (null !== productMatch && undefined !== productMatch[1]) {
+    return { view: 'product', productId: Number(productMatch[1]) };
+  }
+
+  if ('#/results' === hash) {
+    return { view: 'results', productId: null };
+  }
+
+  if ('#/stores' === hash) {
+    return { view: 'stores', productId: null };
+  }
+
+  if ('#/add' === hash) {
+    return { view: 'add', productId: null };
+  }
+
+  return { view: 'home', productId: null };
+};
+
 export const App = () => {
   const queryClient = useQueryClient();
-  const [view, setView] = useState<View>('home');
+  const [view, setView] = useState<View>(() => hashToState(window.location.hash).view);
   const [query, setQuery] = useState('');
-  const [selectedProductId, setSelectedProductId] = useState<number | null>(null);
+  const [selectedProductId, setSelectedProductId] = useState<number | null>(
+    () => hashToState(window.location.hash).productId,
+  );
   const [sort, setSort] = useState<ResultSort>('price');
   const [selectedRetailers, setSelectedRetailers] = useState<Set<RetailerId>>(
     () => new Set(RETAILER_LABELS.keys()),
@@ -48,12 +93,47 @@ export const App = () => {
       ? null
       : (products.find((product) => product.id === selectedProductId) ?? null);
 
+  // --- Hash-based routing -------------------------------------------------
+  // Reflect the navigational state into location.hash so Back/Forward work, a
+  // product page is shareable/deep-linkable, and a refresh restores the view.
+  // Hash (not path) routing is deliberate: the Worker serves the SPA and routes
+  // /api/* to Hono from one origin, and a path router would need a single-page
+  // asset fallback that could swallow /api/*. The hash never reaches the server,
+  // so this needs zero Worker/infra change. `query`/`sort`/filters stay in state
+  // (transient) — only view + product id are navigational.
+  useEffect(() => {
+    const nextHash = stateToHash(view, selectedProductId);
+    // Treat '' and '#/' as the same home URL so the initial "/" stays clean.
+    const current = '' === window.location.hash ? '#/' : window.location.hash;
+
+    if (nextHash !== current) {
+      window.location.hash = nextHash;
+    }
+  }, [view, selectedProductId]);
+
+  useEffect(() => {
+    const onHashChange = () => {
+      const route = hashToState(window.location.hash);
+      setView(route.view);
+      setSelectedProductId(route.productId);
+    };
+
+    window.addEventListener('hashchange', onHashChange);
+
+    return () => window.removeEventListener('hashchange', onHashChange);
+  }, []);
+
   const handleScrape = async () => {
     setIsScraping(true);
 
     try {
       await triggerScrape();
-      await queryClient.invalidateQueries({ queryKey: ['products'] });
+      // Refresh both the product list AND any open price-history chart — a
+      // scrape writes new price_history rows, so ['history', id] is stale too.
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: ['products'] }),
+        queryClient.invalidateQueries({ queryKey: ['history'] }),
+      ]);
     } finally {
       setIsScraping(false);
     }
@@ -204,6 +284,16 @@ const renderView = (args: RenderArgs) => {
         onGoHome={args.onGoHome}
         onPickRetailer={args.onPickRetailer}
       />
+    );
+  }
+
+  // Deep-link/refresh to #/product/<id>: the product list may still be loading,
+  // so show a spinner rather than falling through to the results list.
+  if ('product' === args.view && null === args.selectedProduct && args.isLoading) {
+    return (
+      <section className="py-8">
+        <p className="font-mono text-sm text-muted">Φόρτωση προϊόντος…</p>
+      </section>
     );
   }
 

@@ -15,7 +15,7 @@ interface Bucket {
 const MAX_BARS = 14;
 
 export const PriceHistoryChart = ({ productId }: PriceHistoryChartProps) => {
-  const { data: history, isLoading } = useQuery({
+  const { data: history, isLoading, isError } = useQuery({
     queryKey: ['history', productId],
     queryFn: () => fetchProductHistory(productId),
   });
@@ -24,18 +24,30 @@ export const PriceHistoryChart = ({ productId }: PriceHistoryChartProps) => {
 
   return (
     <div className="rounded-2xl border-2 border-ink bg-white p-5">
-      <div className="mb-4 flex items-baseline justify-between">
+      <div className="mb-1 flex items-baseline justify-between">
         <span className="font-mono text-xs tracking-wide">ΙΣΤΟΡΙΚΟ ΤΙΜΩΝ</span>
         <span className="font-mono text-xs text-ink">{deltaLabel(buckets, isLoading)}</span>
       </div>
-      {renderBody(buckets, isLoading)}
+      {/* Be explicit about what the bars are: the lowest price found each day
+          across all tracked chains — so a gap in the usually-cheapest chain
+          reads honestly, not as a price spike for one store. */}
+      <div className="mb-4 font-mono text-[10px] tracking-wide text-faint">
+        χαμηλότερη τιμή ανά ημέρα σε όλα τα καταστήματα
+      </div>
+      {renderBody(buckets, isLoading, isError)}
     </div>
   );
 };
 
-const renderBody = (buckets: Bucket[], isLoading: boolean) => {
+const renderBody = (buckets: Bucket[], isLoading: boolean, isError: boolean) => {
   if (isLoading) {
     return <p className="font-mono text-sm text-muted">Φόρτωση ιστορικού…</p>;
+  }
+
+  if (isError) {
+    return (
+      <p className="font-mono text-sm text-danger">Δεν φορτώθηκε το ιστορικό — δοκίμασε ξανά.</p>
+    );
   }
 
   if (0 === buckets.length) {
@@ -43,7 +55,6 @@ const renderBody = (buckets: Bucket[], isLoading: boolean) => {
   }
 
   const prices = buckets.map((bucket) => bucket.price);
-  const min = Math.min(...prices);
   const max = Math.max(...prices);
   const lastIndex = buckets.length - 1;
 
@@ -67,7 +78,7 @@ const renderBody = (buckets: Bucket[], isLoading: boolean) => {
                 className={`w-full rounded-t-md border-[1.5px] border-b-0 border-ink ${
                   isLast ? 'bg-accent' : 'bg-ink'
                 }`}
-                style={{ height: barHeight(bucket.price, min, max) }}
+                style={{ height: barHeight(bucket.price, max) }}
                 title={`${bucket.label}: ${formatEuro(bucket.price)}`}
               />
             </div>
@@ -88,14 +99,15 @@ const renderBody = (buckets: Bucket[], isLoading: boolean) => {
   );
 };
 
-const barHeight = (price: number, min: number, max: number): string => {
-  if (max === min) {
-    return '70%';
+const barHeight = (price: number, max: number): string => {
+  if (0 >= max) {
+    return '0%';
   }
 
-  const ratio = (price - min) / (max - min);
-
-  return `${(28 + ratio * 72).toFixed(0)}%`;
+  // Zero-based: bar height is proportional to the actual price, so a 1–2% move
+  // reads as a 1–2% move (the old min→max rescale exaggerated it into a
+  // "doubling"). Precision lives in the numeric delta label above.
+  return `${((price / max) * 100).toFixed(1)}%`;
 };
 
 const deltaLabel = (buckets: Bucket[], isLoading: boolean): string => {

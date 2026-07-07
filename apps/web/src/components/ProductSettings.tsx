@@ -48,7 +48,13 @@ export const ProductSettings = ({ product, onDeleted }: ProductSettingsProps) =>
     };
   }, []);
 
-  const refresh = () => queryClient.invalidateQueries({ queryKey: ['products'] });
+  // Unlinking a store removes its price_history too, so the product's
+  // cheapest-per-day chart changes — refresh both.
+  const refresh = () =>
+    Promise.all([
+      queryClient.invalidateQueries({ queryKey: ['products'] }),
+      queryClient.invalidateQueries({ queryKey: ['history', product.id] }),
+    ]);
 
   const dirty =
     title.trim() !== product.title ||

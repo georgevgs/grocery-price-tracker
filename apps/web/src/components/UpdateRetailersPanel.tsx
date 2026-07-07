@@ -13,11 +13,11 @@ import { ErrorNotice } from './ErrorNotice';
 import { CandidateGroups } from './RetailerCandidates';
 import { SearchProgressBoard, useSearchProgress } from './SearchProgressBoard';
 import {
+  AUTO_PICK_THRESHOLD,
   collectConfirmedEan,
   collectSelectedListings,
   RETAILER_LABELS,
   searchAndRank,
-  SUGGESTION_THRESHOLD,
   type RankedResult,
 } from '../lib/matching';
 
@@ -98,7 +98,7 @@ export const UpdateRetailersPanel = ({ product }: UpdateRetailersPanelProps) => 
         await queryClient.invalidateQueries({ queryKey: ['products'] });
       }
 
-      const { ranked, errors: searchErrors, discoveredEan } = await searchAndRank(
+      const { ranked, errors: searchErrors } = await searchAndRank(
         product.title,
         product.brand,
         searchEan,
@@ -114,19 +114,22 @@ export const UpdateRetailersPanel = ({ product }: UpdateRetailersPanelProps) => 
         const top = list.slice(0, MAX_CANDIDATES);
         sliced.set(retailer, top);
 
+        // Only pre-select a confident, size-verified top match; leave weaker
+        // or size-unverified ones unchecked for the user to confirm.
         const best = top[0];
         const autoPick =
-          undefined !== best && null !== best.score && SUGGESTION_THRESHOLD <= best.score
+          undefined !== best &&
+          null !== best.score &&
+          AUTO_PICK_THRESHOLD <= best.score &&
+          false === best.sizeUnverified
             ? best.result.sku
             : null;
         preselected.set(retailer, autoPick);
       }
 
-      // Surface an EAN discovered from a strong match — saving a pick
-      // that carries it will persist it (collectConfirmedEan).
-      if (null !== discoveredEan && 0 === ean.trim().length) {
-        setEan(discoveredEan);
-      }
+      // A barcode discovered from a single fuzzy match is NOT auto-filled here
+      // (that persists an unverified identity); handleSave adopts one only from
+      // confirmed picks that agree (collectConfirmedEan).
 
       setCandidates(sliced);
       setSelectedSkus(preselected);

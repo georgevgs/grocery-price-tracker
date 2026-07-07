@@ -7,7 +7,15 @@ import { PriceHistoryChart } from '../components/PriceHistoryChart';
 import { ProductImage } from '../components/ProductImage';
 import { ProductSettings } from '../components/ProductSettings';
 import { UpdateRetailersPanel } from '../components/UpdateRetailersPanel';
-import { bestListing, formatEuro, priceOf, sizeLabel } from '../lib/format';
+import {
+  bestListing,
+  formatEuro,
+  freshnessLabel,
+  priceFreshness,
+  priceOf,
+  sizeLabel,
+  unitPriceLabel,
+} from '../lib/format';
 
 interface ProductViewProps {
   product: ProductWithListings;
@@ -114,6 +122,9 @@ const CheapestPanel = ({ best, bestPrice }: CheapestPanelProps) => {
   }
 
   const retailer = RETAILER_LABELS.get(best.retailer) ?? best.retailer;
+  const fresh = priceFreshness(best);
+  const freshLabel = freshnessLabel(fresh);
+  const unitPrice = unitPriceLabel(best);
 
   return (
     <div className="flex flex-wrap items-center justify-between gap-4 rounded-2xl border-2 border-ink bg-ink px-6 py-[22px] text-white shadow-hard-accent">
@@ -127,6 +138,15 @@ const CheapestPanel = ({ best, bestPrice }: CheapestPanelProps) => {
         <div className="mt-2 text-sm">
           στο <b>{retailer}</b>
         </div>
+        {(null !== unitPrice || null !== freshLabel) && (
+          <div
+            className={`mt-1.5 font-mono text-[11px] ${fresh.isStale ? 'text-warn' : 'text-[#b9b9b0]'}`}
+          >
+            {null !== unitPrice ? unitPrice : ''}
+            {null !== unitPrice && null !== freshLabel ? ' · ' : ''}
+            {null !== freshLabel ? `${fresh.isStale ? '⚠ ' : ''}ενημ. ${freshLabel}` : ''}
+          </div>
+        )}
       </div>
       <a
         href={best.url}
@@ -148,6 +168,9 @@ interface PriceRowProps {
 const PriceRow = ({ listing, isCheapest }: PriceRowProps) => {
   const price = priceOf(listing);
   const retailer = RETAILER_LABELS.get(listing.retailer) ?? listing.retailer;
+  const unitPrice = unitPriceLabel(listing);
+  const fresh = priceFreshness(listing);
+  const freshLabel = freshnessLabel(fresh);
 
   return (
     <a
@@ -166,8 +189,18 @@ const PriceRow = ({ listing, isCheapest }: PriceRowProps) => {
         />
         {retailer}
       </span>
-      <span className="font-mono text-[18px] font-bold">
-        {null !== price ? formatEuro(price) : '—'}
+      <span className="flex flex-col items-end leading-tight">
+        <span className="font-mono text-[18px] font-bold">
+          {null !== price ? formatEuro(price) : '—'}
+        </span>
+        {null !== unitPrice && (
+          <span className="font-mono text-[10px] text-muted">{unitPrice}</span>
+        )}
+        {null !== freshLabel && (
+          <span className={`font-mono text-[10px] ${fresh.isStale ? 'text-warn' : 'text-faint'}`}>
+            {fresh.isStale ? `⚠ ${freshLabel}` : freshLabel}
+          </span>
+        )}
       </span>
     </a>
   );
