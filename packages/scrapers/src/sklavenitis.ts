@@ -30,8 +30,14 @@ const USER_AGENT = 'Mozilla/5.0 (X11; Linux x86_64) personal-price-watch/1.0';
  */
 export const sklavenitisAdapter: RetailerAdapter = {
   id: 'sklavenitis',
-  // sklavenitis.gr's WAF blocks Cloudflare egress IPs; residential works.
-  needsResidentialEgress: true,
+  // sklavenitis.gr's WAF USED to block Cloudflare egress IPs, so this carried
+  // needsResidentialEgress and every edge search/resolve cost a proxy credit.
+  // Re-probed from a real Worker egress IP on 2026-07-07 (wrangler dev --remote,
+  // src/probe.ts): search returns results AND the product page parses a price,
+  // 3/3, HTTP 200 — the block is gone. So it now answers the edge directly on
+  // the free global fetch and costs nothing. If it starts 403/503-ing again,
+  // set `needsResidentialEgress: true` here to route it back through the proxy.
+  // (AB, re-probed the same way, still 403s the edge — it keeps its flag.)
 
   async scrapeProduct(url, fetchImpl) {
     const response = await fetchImpl(url, {
