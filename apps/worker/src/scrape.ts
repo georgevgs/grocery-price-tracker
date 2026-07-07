@@ -5,6 +5,12 @@ import { ListingGoneError } from '@grocery/scrapers/types';
 
 export interface Env {
   DB: D1Database;
+  /**
+   * Optional shared secret. When set (wrangler secret), every mutating
+   * API route requires it as a Bearer token; unset leaves the guard inert
+   * so existing deployments keep working. See the guard in index.ts.
+   */
+  WRITE_TOKEN?: string;
 }
 
 interface ListingRow {
@@ -90,6 +96,12 @@ const scrapeOne = async (
       productBrand: listing.product_brand,
     });
 
+    const priceError = missingPriceError(listing.id, listing.retailer, scraped);
+
+    if (undefined !== priceError) {
+      return { error: priceError };
+    }
+
     await env.DB.prepare(
       'INSERT OR REPLACE INTO price_history ' +
         '(listing_id, scraped_date, scraped_at, price_piece, price_unit, unit_label) ' +
@@ -148,6 +160,28 @@ export const scrapeFailureOutcome = (listingId: number, error: unknown): ScrapeO
   }
 
   return { error: `listing ${listingId}: unknown error` };
+};
+
+/**
+ * A resolved product carrying NO price at all — neither a piece price nor a
+ * per-unit price — means the price selector silently broke. Retailers rename
+ * price fields without notice, and the adapters' guards only check name/SKU,
+ * so a break otherwise writes a null-null row that flat-lines the chart and
+ * hides the failure. Surfacing it as an error instead keeps the last good
+ * price and makes a chain-wide break show up in the run's errors[]. Weight-
+ * priced items are unaffected: they carry a per-unit price, so only the
+ * genuinely price-less case trips this.
+ */
+export const missingPriceError = (
+  listingId: number,
+  retailer: string,
+  scraped: Pick<ScrapedListing, 'pricePiece' | 'priceUnit'>,
+): string | undefined => {
+  if (null === scraped.pricePiece && null === scraped.priceUnit) {
+    return `listing ${listingId} (${retailer}): resolved but no price found — selector may have changed`;
+  }
+
+  return undefined;
 };
 
 const SANITY_DIVERGENCE = 0.2;

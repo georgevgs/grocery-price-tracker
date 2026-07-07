@@ -3,8 +3,15 @@ import { AdapterError, type RetailerAdapter } from './types';
 
 const GRAPHQL_URL = 'https://magento2.galaxias.shop/graphql';
 const BASE_URL = 'https://galaxias.shop';
-// Canonical product URLs are /product/<sku>; the SKU is the EAN-13 barcode.
+// Canonical product URLs are /product/<sku>; the SKU is USUALLY the EAN-13
+// barcode, but the pattern also admits non-numeric SKUs, so validate before
+// trusting one as the cross-chain identity (see EAN_PATTERN below).
 const SKU_FROM_URL_PATTERN = /\/product\/([A-Za-z0-9_-]+)/;
+
+// Only a barcode-shaped SKU may become products.ean (the cross-chain join
+// key); an alphanumeric/internal SKU would be a false identity. Matches the
+// validation @grocery/core applies to user-pasted EANs.
+const EAN_PATTERN = /^\d{8,14}$/;
 
 const USER_AGENT = 'Mozilla/5.0 (X11; Linux x86_64) personal-price-watch/1.0';
 
@@ -144,8 +151,10 @@ export const mapProductsResponse = (body: unknown, url: string): RetailerSearchR
       title: name,
       url: `${BASE_URL}/product/${sku}`,
       brand: null,
-      // Galaxias SKUs ARE the pack barcodes (EAN-13).
-      ean: sku,
+      // Galaxias SKUs are USUALLY the pack barcode (EAN-13) — but only stamp
+      // one that actually looks like a barcode, so a non-numeric SKU can't
+      // poison the cross-chain identity.
+      ean: EAN_PATTERN.test(sku) ? sku : null,
       pricePiece,
       priceUnit: toUnitPrice(item['cost_per_unit'], basePrice, pricePiece),
       unitLabel: toUnitLabel(item['unit_measurement']),
@@ -218,7 +227,10 @@ const applyCatalogRules = (price: number | null, rawRules: unknown): number | nu
     }
   }
 
-  return Math.round(discounted * 100) / 100;
+  // Clamp to ≥0: a malformed rule (fixed amount larger than the price) or
+  // several stacked rules must never store a negative/nonsense price — a
+  // storefront never shows one. Faithful to the mirrored algorithm otherwise.
+  return Math.max(0, Math.round(discounted * 100) / 100);
 };
 
 /**

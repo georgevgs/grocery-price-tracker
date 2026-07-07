@@ -27,7 +27,7 @@ import type { RetailerId } from '@grocery/core/types';
 import { adapterRegistry } from '@grocery/scrapers/registry';
 import { buildCatalogIndex, type KritikosCatalogEntry } from '@grocery/scrapers/kritikos';
 import { buildAbCatalogIndex, type AbCatalogEntry } from '@grocery/scrapers/ab';
-import { scrapeFailureOutcome, unitPriceSanityWarning } from '../src/scrape';
+import { missingPriceError, scrapeFailureOutcome, unitPriceSanityWarning } from '../src/scrape';
 
 const WORKER_DIR = join(dirname(fileURLToPath(import.meta.url)), '..');
 const DATABASE = 'grocery-prices';
@@ -142,6 +142,12 @@ const scrapeOne = async (target: TargetRow): Promise<Outcome> => {
       productTitle: `${target.product_brand} ${target.product_title}`.trim(),
       productBrand: target.product_brand,
     });
+
+    const priceError = missingPriceError(target.id, target.retailer, scraped);
+
+    if (undefined !== priceError) {
+      return { error: priceError };
+    }
 
     const price: PriceWrite = {
       listingId: target.id,

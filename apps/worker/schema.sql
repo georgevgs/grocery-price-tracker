@@ -37,6 +37,11 @@ CREATE TABLE IF NOT EXISTS price_history (
 CREATE INDEX IF NOT EXISTS idx_price_history_listing
     ON price_history (listing_id, scraped_date);
 
+-- product_id is the FK joined/filtered on by every listing read, the two
+-- delete handlers, and the daily scrape's JOIN; without this it's a full scan.
+CREATE INDEX IF NOT EXISTS idx_retailer_listings_product
+    ON retailer_listings (product_id);
+
 -- Memoized Open Food Facts barcode lookups. Product data is near-static,
 -- so a scanned EAN is fetched from OFF once and served locally after.
 -- `found` = 1 when a name was resolved; negatives are cached too (with a

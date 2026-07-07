@@ -61,6 +61,40 @@ const app = new Hono<{ Bindings: Env }>();
 
 app.use('/api/*', cors());
 
+/**
+ * Optional write guard. The API is public (the PWA is served same-origin and
+ * calls it with relative URLs), but the mutating routes must not be an open
+ * free-for-all — otherwise anyone can create, edit, delete or trigger a
+ * scrape. When WRITE_TOKEN is configured, every non-GET request must present
+ * it as a Bearer token; when it is unset the guard is inert, so a deployment
+ * keeps working until the secret and the matching client header are rolled
+ * out together. NOTE: a token baked into a public PWA bundle only deters
+ * casual/automated abuse — Cloudflare Access in front of the Worker is the
+ * real fix for a genuine multi-user threat model.
+ */
+app.use('/api/*', async (c, next) => {
+  const method = c.req.method;
+
+  if ('GET' === method || 'HEAD' === method || 'OPTIONS' === method) {
+    return next();
+  }
+
+  const required = c.env.WRITE_TOKEN;
+
+  if (undefined === required || 0 === required.length) {
+    return next();
+  }
+
+  const header = c.req.header('Authorization') ?? '';
+  const presented = header.startsWith('Bearer ') ? header.slice(7) : '';
+
+  if (presented !== required) {
+    return c.json({ error: 'unauthorized' }, 401);
+  }
+
+  return next();
+});
+
 app.get('/', (c) => {
   return c.json({
     service: 'grocery-price-tracker-api',
@@ -331,33 +365,75 @@ const seedListingPrices = async (
 app.post('/api/products', async (c) => {
   const payload = await c.req.json<CreateProductPayload>();
 
-  if ('string' !== typeof payload.brand || 0 === payload.brand.length) {
+  if ('string' !== typeof payload.brand || 0 === payload.brand.trim().length) {
     return c.json({ error: 'brand is required' }, 400);
   }
 
-  if ('string' !== typeof payload.title || 0 === payload.title.length) {
+  if ('string' !== typeof payload.title || 0 === payload.title.trim().length) {
     return c.json({ error: 'title is required' }, 400);
+  }
+
+  // Validate the barcode on create too (PATCH already does) — a malformed
+  // EAN would otherwise become a bogus cross-chain identity.
+  const ean = payload.ean ?? null;
+
+  if (null !== ean && ('string' !== typeof ean || false === /^\d{8,14}$/.test(ean))) {
+    return c.json({ error: 'ean must be 8-14 digits or null' }, 400);
+  }
+
+  const listings = Array.isArray(payload.listings) ? payload.listings : [];
+
+  for (const listing of listings) {
+    if (
+      'string' !== typeof listing.retailer ||
+      'string' !== typeof listing.retailerSku ||
+      'string' !== typeof listing.url
+    ) {
+      return c.json({ error: 'each listing needs retailer, retailerSku and url' }, 400);
+    }
   }
 
   const imageUrl = 'string' === typeof payload.imageUrl && 0 < payload.imageUrl.length ? payload.imageUrl : null;
 
-  const insertProduct = await c.env.DB.prepare(
-    'INSERT INTO products (ean, brand, title, size_value, size_unit, image_url) VALUES (?, ?, ?, ?, ?, ?)',
-  )
-    .bind(payload.ean, payload.brand, payload.title, payload.sizeValue, payload.sizeUnit, imageUrl)
-    .run();
+  let productId: number | bigint;
 
-  const productId = insertProduct.meta.last_row_id;
+  try {
+    // Optionals may arrive undefined; D1 .bind() rejects undefined, so coalesce.
+    const insertProduct = await c.env.DB.prepare(
+      'INSERT INTO products (ean, brand, title, size_value, size_unit, image_url) VALUES (?, ?, ?, ?, ?, ?)',
+    )
+      .bind(
+        ean,
+        payload.brand.trim(),
+        payload.title.trim(),
+        payload.sizeValue ?? null,
+        payload.sizeUnit ?? null,
+        imageUrl,
+      )
+      .run();
 
-  if (0 < payload.listings.length) {
-    const statements = payload.listings.map((listing) => {
+    productId = insertProduct.meta.last_row_id;
+  } catch (error) {
+    // products.ean is UNIQUE — a duplicate barcode is a conflict, not a 500.
+    if (error instanceof Error && error.message.includes('UNIQUE')) {
+      return c.json({ error: 'a product with this barcode already exists' }, 409);
+    }
+
+    throw error;
+  }
+
+  if (0 < listings.length) {
+    // OR IGNORE: a (retailer, sku) already tracked by another product is
+    // skipped rather than throwing UNIQUE and leaving this product an orphan
+    // with no listings (matches POST /:id/listings).
+    const statements = listings.map((listing) => {
       return c.env.DB.prepare(
-        'INSERT INTO retailer_listings (product_id, retailer, retailer_sku, url) VALUES (?, ?, ?, ?)',
+        'INSERT OR IGNORE INTO retailer_listings (product_id, retailer, retailer_sku, url) VALUES (?, ?, ?, ?)',
       ).bind(productId, listing.retailer, listing.retailerSku, listing.url);
     });
 
     await c.env.DB.batch(statements);
-    await seedListingPrices(c.env, Number(productId), payload.listings);
+    await seedListingPrices(c.env, Number(productId), listings);
   }
 
   return c.json({ id: productId }, 201);
@@ -596,7 +672,14 @@ app.delete('/api/products/:id/listings/:listingId', async (c) => {
   }
 
   const [, listingDelete] = await c.env.DB.batch([
-    c.env.DB.prepare('DELETE FROM price_history WHERE listing_id = ?').bind(listingId),
+    // Scope the history delete to the listing ONLY when it belongs to this
+    // product. The two statements commit atomically as one batch, so the
+    // history delete must carry the same (id, product_id) guard as the
+    // listing delete below — otherwise a wrong/stale product id wipes the
+    // listing's entire price history while the listing row survives.
+    c.env.DB.prepare(
+      'DELETE FROM price_history WHERE listing_id IN (SELECT id FROM retailer_listings WHERE id = ? AND product_id = ?)',
+    ).bind(listingId, productId),
     c.env.DB.prepare('DELETE FROM retailer_listings WHERE id = ? AND product_id = ?').bind(
       listingId,
       productId,
@@ -680,26 +763,36 @@ const cacheRowToInfo = (row: BarcodeCacheRow): BarcodeInfo => {
  * that later gets annotated on OFF gets picked up on a subsequent scan.
  */
 const readBarcodeCache = async (env: Env, ean: string): Promise<BarcodeCacheRow | null> => {
-  const row = await env.DB.prepare(
-    `SELECT name, brand, quantity, image_url, found,
-            (cached_at > datetime('now', CASE WHEN found = 1 THEN '-90 days' ELSE '-14 days' END)) AS is_fresh
-     FROM barcode_cache
-     WHERE ean = ?`,
-  )
-    .bind(ean)
-    .first<BarcodeCacheRow>();
+  try {
+    const row = await env.DB.prepare(
+      `SELECT name, brand, quantity, image_url, found,
+              (cached_at > datetime('now', CASE WHEN found = 1 THEN '-90 days' ELSE '-14 days' END)) AS is_fresh
+       FROM barcode_cache
+       WHERE ean = ?`,
+    )
+      .bind(ean)
+      .first<BarcodeCacheRow>();
 
-  return row ?? null;
+    return row ?? null;
+  } catch {
+    // Missing/unmigrated barcode_cache must degrade to a live OFF lookup, not
+    // 500 the route — it's a pure cache (mirrors the search_cache helpers).
+    return null;
+  }
 };
 
 const writeBarcodeCache = async (env: Env, ean: string, info: BarcodeInfo): Promise<void> => {
-  await env.DB.prepare(
-    `INSERT OR REPLACE INTO barcode_cache
-       (ean, name, brand, quantity, image_url, source, found, cached_at)
-     VALUES (?, ?, ?, ?, ?, 'openfoodfacts', ?, datetime('now'))`,
-  )
-    .bind(ean, info.name, info.brand, info.quantity, info.imageUrl, null !== info.name ? 1 : 0)
-    .run();
+  try {
+    await env.DB.prepare(
+      `INSERT OR REPLACE INTO barcode_cache
+         (ean, name, brand, quantity, image_url, source, found, cached_at)
+       VALUES (?, ?, ?, ?, ?, 'openfoodfacts', ?, datetime('now'))`,
+    )
+      .bind(ean, info.name, info.brand, info.quantity, info.imageUrl, null !== info.name ? 1 : 0)
+      .run();
+  } catch {
+    // A cache write must never fail the lookup — swallow and move on.
+  }
 };
 
 /**
