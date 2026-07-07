@@ -68,7 +68,7 @@ export const runScrape = async (env: Env): Promise<ScrapeRunResult> => {
  * Shelf prices belong to the shopper's calendar day, not UTC's —
  * the 05:15 UTC cron runs at 07:15/08:15 in Greece.
  */
-const athensDate = (): string => {
+export const athensDate = (): string => {
   return new Date().toLocaleDateString('en-CA', { timeZone: 'Europe/Athens' });
 };
 

@@ -197,7 +197,16 @@ export const UpdateRetailersPanel = ({ product }: UpdateRetailersPanelProps) => 
       }
 
       await addListings(product.id, [
-        { retailer: resolved.retailer, retailerSku: resolved.sku, url: resolved.url },
+        {
+          retailer: resolved.retailer,
+          retailerSku: resolved.sku,
+          url: resolved.url,
+          // resolve-url scrapes the page, so it already carries today's price —
+          // seed it so a blocked chain shows a price without a post-save scrape.
+          pricePiece: resolved.pricePiece,
+          priceUnit: resolved.priceUnit,
+          unitLabel: resolved.unitLabel,
+        },
       ]);
       await triggerScrape().catch(() => {});
       await refresh();

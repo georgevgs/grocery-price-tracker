@@ -87,6 +87,15 @@ export interface CreateListingPayload {
   retailer: RetailerId;
   retailerSku: string;
   url: string;
+  // The price the user just saw for this listing (from search or resolve-url).
+  // Seeded into price_history at save so the product shows today's price
+  // immediately — the post-save edge scrape can't reach the WAF-blocked chains
+  // (AB/Kritikos/Sklavenitis), so without this they'd read "—" until the next
+  // off-edge daily scrape. Null when the source carried no price; the daily
+  // scrape backfills.
+  pricePiece: number | null;
+  priceUnit: number | null;
+  unitLabel: string | null;
 }
 
 /**

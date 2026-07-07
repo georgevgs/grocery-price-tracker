@@ -120,6 +120,11 @@ export const collectSelectedListings = (
       retailer,
       retailerSku: picked.result.sku,
       url: picked.result.url,
+      // Seed today's price from the confirmed pick so blocked chains show it
+      // immediately (see CreateListingPayload) rather than waiting on a scrape.
+      pricePiece: picked.result.pricePiece,
+      priceUnit: picked.result.priceUnit,
+      unitLabel: picked.result.unitLabel,
     });
   }
 

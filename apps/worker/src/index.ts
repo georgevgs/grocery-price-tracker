@@ -13,7 +13,7 @@ import type {
 import { adapterRegistry } from '@grocery/scrapers/registry';
 import { queryTokens } from '@grocery/scrapers/kritikos';
 import type { RetailerAdapter, SearchHints } from '@grocery/scrapers/types';
-import { runScrape, type Env } from './scrape';
+import { athensDate, runScrape, type Env } from './scrape';
 import { makeResidentialFetch } from './residential-fetch';
 import { lookupBarcode, type BarcodeInfo } from './openfoodfacts';
 
@@ -290,6 +290,61 @@ app.get('/api/barcode/:ean', async (c) => {
   return c.json(info);
 });
 
+/**
+ * Seed today's price_history for freshly linked listings from the price the
+ * client already observed (search tile / resolve-url). Without this, the price
+ * shown after saving depends on the immediate /api/scrape/run, which runs on the
+ * edge with a plain fetch and so 403/503s on the WAF-blocked chains (AB,
+ * Kritikos, Sklavenitis) — they'd read "—" until the next off-edge daily scrape.
+ *
+ * Resolves each listing's id by its (product_id, retailer, retailer_sku) unique
+ * key via INSERT…SELECT, so it works whether the listings were just batch- or
+ * OR-IGNORE-inserted. Listings with no price are skipped (the daily scrape fills
+ * them); INSERT OR REPLACE keeps it idempotent with a same-day scrape.
+ */
+const seedListingPrices = async (
+  env: Env,
+  productId: number,
+  listings: readonly CreateListingPayload[],
+): Promise<void> => {
+  const scrapedDate = athensDate();
+  const scrapedAt = new Date().toISOString();
+
+  const statements: D1PreparedStatement[] = [];
+
+  for (const listing of listings) {
+    const pricePiece = listing.pricePiece ?? null;
+    const priceUnit = listing.priceUnit ?? null;
+
+    // Nothing observed → let the daily scrape record the first price.
+    if (null === pricePiece && null === priceUnit) {
+      continue;
+    }
+
+    statements.push(
+      env.DB.prepare(
+        'INSERT OR REPLACE INTO price_history ' +
+          '(listing_id, scraped_date, scraped_at, price_piece, price_unit, unit_label) ' +
+          'SELECT id, ?, ?, ?, ?, ? FROM retailer_listings ' +
+          'WHERE product_id = ? AND retailer = ? AND retailer_sku = ?',
+      ).bind(
+        scrapedDate,
+        scrapedAt,
+        pricePiece,
+        priceUnit,
+        listing.unitLabel ?? null,
+        productId,
+        listing.retailer,
+        listing.retailerSku,
+      ),
+    );
+  }
+
+  if (0 < statements.length) {
+    await env.DB.batch(statements);
+  }
+};
+
 app.post('/api/products', async (c) => {
   const payload = await c.req.json<CreateProductPayload>();
 
@@ -319,6 +374,7 @@ app.post('/api/products', async (c) => {
     });
 
     await c.env.DB.batch(statements);
+    await seedListingPrices(c.env, Number(productId), payload.listings);
   }
 
   return c.json({ id: productId }, 201);
@@ -603,6 +659,11 @@ app.post('/api/products/:id/listings', async (c) => {
 
   const outcomes = await c.env.DB.batch(statements);
   const added = outcomes.reduce((sum, outcome) => sum + outcome.meta.changes, 0);
+
+  // Seed today's price for the linked listings from what the client observed.
+  // Re-linking an already-tracked listing just refreshes today's price to the
+  // same current value (harmless), so seeding all of them is fine.
+  await seedListingPrices(c.env, productId, payload.listings);
 
   return c.json({ added }, 201);
 });
