@@ -15,7 +15,6 @@ import { queryTokens } from '@grocery/scrapers/kritikos';
 import { abQueryTokens } from '@grocery/scrapers/ab';
 import type { RetailerAdapter, SearchHints } from '@grocery/scrapers/types';
 import { athensDate, runScrape, type Env } from './scrape';
-import { makeResidentialFetch } from './residential-fetch';
 import { lookupBarcode, type BarcodeInfo } from './openfoodfacts';
 
 interface ProductRow {
@@ -180,58 +179,28 @@ app.get('/api/retailer-search', async (c) => {
   const rawEan = c.req.query('ean')?.trim();
   const eanHint = undefined !== rawEan && /^\d{8,14}$/.test(rawEan) ? rawEan : undefined;
 
-  // Chains flagged needsResidentialEgress (AB, Kritikos, Sklavenitis) 403/503
-  // from Cloudflare's edge, so route them through the residential scraping API
-  // when a token is configured; everyone else uses the free global fetch.
-  // AB additionally needs headless render (needsRenderedSearch) — its search API
-  // is blocked through the proxy, so we render its search page and the adapter
-  // parses the tiles (hints.rendered). Without a token the flagged chains just
-  // fail into errors[] as before — search degrades, never crashes.
-  const proxyToken = c.env.RESIDENTIAL_PROXY_TOKEN;
-  const hasProxy = undefined !== proxyToken && 0 < proxyToken.length;
-
-  const fetchFor = (adapter: RetailerAdapter): typeof fetch => {
-    if (true !== adapter.needsResidentialEgress || undefined === proxyToken || 0 === proxyToken.length) {
-      return fetch;
-    }
-
-    return makeResidentialFetch(proxyToken, { render: true === adapter.needsRenderedSearch });
-  };
-
-  const hintsFor = (adapter: RetailerAdapter): SearchHints => ({
-    ean: eanHint,
-    rendered: true === adapter.needsRenderedSearch && hasProxy,
-  });
+  // No chain needs the residential render proxy anymore: AB and Kritikos (which
+  // 403/503 the edge) are served entirely from their off-edge D1 catalog indexes
+  // below, and every other chain — Sklavenitis included, since its WAF stopped
+  // blocking Cloudflare egress — answers the edge directly on the free global
+  // fetch. So Scrape.do is fully retired; the live path just uses `fetch`.
+  const searchHints: SearchHints = { ean: eanHint };
 
   // '' when no EAN hint — part of the cache key so an EAN-guided search (which
-  // surfaces the exact product first) never collides with the plain query. The
-  // rendered/direct transport is NOT part of the key: both paths yield the same
-  // listings, so a cache entry is reusable regardless of how it was fetched.
+  // surfaces the exact product first) never collides with the plain query.
   const eanKey = eanHint ?? '';
 
   const searchOne = async (adapter: RetailerAdapter): Promise<RetailerSearchResult[]> => {
-    // Kritikos has no server-side search: its live adapter downloads the whole
-    // ~29 MB catalog and scans it in-invocation, which blows the Workers
-    // free-plan CPU budget on the edge (a 1102/5xx) and re-fetches 29 MB through
-    // the paid proxy on every retry pass. So the edge doesn't run it — it reads
-    // the D1 discovery index the off-edge daily scrape builds instead (a cheap
-    // LIKE over ~8.5k rows). No proxy fetch, so no residential-fetch cache to
-    // consult; the query itself is the cheap part.
+    // Kritikos and AB both 403/503 the edge and have no cheap live edge search
+    // (Kritikos ships none and streaming its ~29 MB catalog blows the CPU budget;
+    // AB's API is unreachable). Both are served from the D1 discovery index the
+    // off-edge daily scrape builds — a cheap LIKE, no proxy, no credits.
     if ('kritikos' === adapter.id) {
       return searchKritikosCatalog(c.env, query, eanHint);
     }
 
-    // AB: same off-edge D1-index treatment as Kritikos (its Akamai WAF 403s the
-    // edge and its API is blocked through the proxy too, so live edge search
-    // means the priciest Scrape.do render tier). searchAbCatalog returns null
-    // until the daily crawl has populated ab_catalog, so during rollout we fall
-    // through to the live proxy search; once populated it serves AB for free.
     if ('ab' === adapter.id) {
-      const indexed = await searchAbCatalog(c.env, query);
-
-      if (null !== indexed) {
-        return indexed;
-      }
+      return searchAbCatalog(c.env, query);
     }
 
     const cached = await readSearchCache(c.env, adapter.id, query, eanKey);
@@ -240,9 +209,9 @@ app.get('/api/retailer-search', async (c) => {
       return cached;
     }
 
-    // A throw here (blocked/failed chain) skips the write below and surfaces in
+    // A throw here (a failed chain) skips the write below and surfaces in
     // errors[], so failures always retry live and never poison the cache.
-    const found = await adapter.searchProducts(query, fetchFor(adapter), hintsFor(adapter));
+    const found = await adapter.searchProducts(query, fetch, searchHints);
     await writeSearchCache(c.env, adapter.id, query, eanKey, found);
     return found;
   };
@@ -443,21 +412,30 @@ app.post('/api/resolve-url', async (c) => {
   parsed.hash = '';
   const url = parsed.toString();
 
-  // Same residential-egress routing as /api/retailer-search: a blocked chain's
-  // product page 403s from the edge, so resolve it through the scraping API
-  // when a token is set; unflagged chains stay on the free global fetch. AB's
-  // search-driven scrape needs render mode + hints.rendered, exactly as search does.
-  const proxyToken = c.env.RESIDENTIAL_PROXY_TOKEN;
-  const canProxy =
-    true === adapter.needsResidentialEgress && undefined !== proxyToken && 0 < proxyToken.length;
-  const render = canProxy && true === adapter.needsRenderedSearch;
-  const scrapeFetch =
-    canProxy && undefined !== proxyToken ? makeResidentialFetch(proxyToken, { render }) : fetch;
+  // AB and Kritikos 403/503 the edge, but their whole catalogs are mirrored into
+  // D1 by the off-edge daily crawl — so resolve a pasted URL straight from that
+  // index (by the SKU the URL embeds) instead of paying the render proxy to fetch
+  // the blocked page. Every other chain (Sklavenitis included) answers the edge
+  // directly, so scrape the page live on the free global fetch.
+  const indexed = await resolveFromCatalog(c.env, adapter.id, url);
+
+  if (null !== indexed) {
+    return c.json(indexed);
+  }
+
+  if ('ab' === adapter.id || 'kritikos' === adapter.id) {
+    // Index-backed but the SKU isn't in the catalog (dropped, or brand-new and
+    // not yet crawled). We no longer keep a proxy to fetch the blocked page, and
+    // a direct edge fetch would just 403/503 — so say so rather than 502.
+    return c.json(
+      { error: 'product not in the catalog index — it should appear after the next daily update' },
+      404,
+    );
+  }
 
   try {
-    const scraped = await adapter.scrapeProduct(url, scrapeFetch, {
+    const scraped = await adapter.scrapeProduct(url, fetch, {
       productTitle: payload.productTitle,
-      rendered: render,
     });
 
     if (null === scraped.sku) {
@@ -907,33 +885,20 @@ const abRowToResult = (row: AbCatalogRow): RetailerSearchResult => ({
  * scrape-local.ts) instead of the paid Scrape.do render path. Each query token
  * becomes a `haystack LIKE ?` AND-term (same fold as the client matcher, via the
  * shared abQueryTokens), mirroring searchKritikosCatalog. AB carries no barcode,
- * so there is no EAN branch.
- *
- * Returns null — NOT [] — when the index is empty or the table is missing (not
- * crawled yet / not migrated), so searchOne can fall back to the live proxy
- * search during the rollout window. Once the daily job has populated ab_catalog,
- * this serves every AB search for free. A genuine no-match returns []. Never
- * throws — this path must not 5xx.
+ * so there is no EAN branch. Best-effort: a missing table (not migrated) or any
+ * query error returns [] so this path never 5xx-es.
  */
 const searchAbCatalog = async (
   env: Env,
   query: string,
-): Promise<RetailerSearchResult[] | null> => {
+): Promise<RetailerSearchResult[]> => {
+  const tokens = abQueryTokens(query);
+
+  if (0 === tokens.length) {
+    return [];
+  }
+
   try {
-    // Empty/unmigrated index → signal "fall back to live search" (null), never
-    // a false "no products" ([]). One cheap probe row distinguishes the two.
-    const probe = await env.DB.prepare('SELECT 1 FROM ab_catalog LIMIT 1').first();
-
-    if (null === probe || undefined === probe) {
-      return null;
-    }
-
-    const tokens = abQueryTokens(query);
-
-    if (0 === tokens.length) {
-      return [];
-    }
-
     const clause = tokens
       .map(() => `haystack LIKE ('%' || ? || '%') ESCAPE '\\'`)
       .join(' AND ');
@@ -945,7 +910,82 @@ const searchAbCatalog = async (
 
     return results.map(abRowToResult);
   } catch {
-    // Table missing (not migrated yet) or any query error → fall back to live.
+    return [];
+  }
+};
+
+/** Which chains are answered from a D1 catalog index rather than a live scrape. */
+const CATALOG_TABLES: Partial<Record<RetailerId, string>> = {
+  ab: 'ab_catalog',
+  kritikos: 'kritikos_catalog',
+};
+
+/** Pull the numeric SKU a catalog-backed chain embeds in its product URL. */
+const skuFromCatalogUrl = (retailer: RetailerId, url: string): string | null => {
+  if ('ab' === retailer) {
+    return url.match(/\/p\/(\d+)/)?.[1] ?? null; // .../p/<sku>
+  }
+
+  if ('kritikos' === retailer) {
+    return url.match(/-(\d+)\/?(?:[?#]|$)/)?.[1] ?? null; // slug ends -<sku>/
+  }
+
+  return null;
+};
+
+interface CatalogResolveRow {
+  sku: string;
+  name: string;
+  price_piece: number | null;
+  price_unit: number | null;
+  unit_label: string | null;
+}
+
+/**
+ * Resolve a pasted URL for a catalog-backed chain (AB, Kritikos) from its D1
+ * index by the SKU the URL embeds — no proxy, no live fetch of the blocked page.
+ * Returns null when the chain isn't index-backed, the URL carries no SKU, or the
+ * SKU isn't indexed, so the caller decides how to respond.
+ */
+const resolveFromCatalog = async (
+  env: Env,
+  retailer: RetailerId,
+  url: string,
+): Promise<Record<string, unknown> | null> => {
+  const table = CATALOG_TABLES[retailer];
+
+  if (undefined === table) {
+    return null;
+  }
+
+  const sku = skuFromCatalogUrl(retailer, url);
+
+  if (null === sku) {
+    return null;
+  }
+
+  try {
+    // `table` comes from the fixed CATALOG_TABLES allowlist above, never input.
+    const row = await env.DB.prepare(
+      `SELECT sku, name, price_piece, price_unit, unit_label FROM ${table} WHERE sku = ?`,
+    )
+      .bind(sku)
+      .first<CatalogResolveRow>();
+
+    if (null === row || undefined === row) {
+      return null;
+    }
+
+    return {
+      retailer,
+      sku: row.sku,
+      name: row.name,
+      url,
+      pricePiece: row.price_piece,
+      priceUnit: row.price_unit,
+      unitLabel: row.unit_label,
+    };
+  } catch {
     return null;
   }
 };

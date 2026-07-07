@@ -5,13 +5,6 @@ import { ListingGoneError } from '@grocery/scrapers/types';
 
 export interface Env {
   DB: D1Database;
-  /**
-   * Scrape.do API token (a Worker secret: `wrangler secret put RESIDENTIAL_PROXY_TOKEN`).
-   * Enables residential egress for the chains that block Cloudflare's edge
-   * (see residential-fetch.ts). Optional: unset in local dev / the scrape
-   * script, where fetches already leave from a residential IP.
-   */
-  RESIDENTIAL_PROXY_TOKEN?: string;
 }
 
 interface ListingRow {

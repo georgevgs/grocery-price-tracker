@@ -10,12 +10,15 @@ So the daily scrape runs **here, on your Mac**, not on Cloudflare:
   already authenticated), fetches each retailer product page over your home
   connection, and writes prices back to the remote D1. Reuses the Worker's
   adapters and its unit-price-sanity / failure helpers, so results match what
-  the cron produced when it still worked. It **also rebuilds `kritikos_catalog`**:
-  Kritikos has no server-side search, and scanning its ~29 MB catalog on the edge
-  blows the Workers free-plan CPU budget, so this job (no CPU limit) flattens the
-  catalog into that D1 table once a day and the edge searches it with a cheap
-  `LIKE`. So this job is the single writer to both `price_history` and
-  `kritikos_catalog`.
+  the cron produced when it still worked. It **also rebuilds two D1 discovery
+  indexes**, `kritikos_catalog` and `ab_catalog`: Kritikos has no server-side
+  search (its ~29 MB catalog scan blows the edge CPU budget) and AB's Akamai WAF
+  403s the edge while its API is blocked through any proxy, so neither can be
+  searched live on the edge. This job (no CPU limit, residential IP) flattens
+  each catalog into its D1 table once a day and the edge searches both with a
+  cheap `LIKE` — so no residential proxy is needed for interactive edge search.
+  That makes this job the single writer to `price_history`, `kritikos_catalog`,
+  and `ab_catalog`.
 - `eu.vagdas.grocery-scrape.plist` — launchd schedule (08:15 Athens, matching the
   old `05:15 UTC` cron).
 

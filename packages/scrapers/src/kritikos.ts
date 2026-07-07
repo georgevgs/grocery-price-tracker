@@ -26,8 +26,11 @@ const MAX_SEARCH_RESULTS = 100;
  */
 export const kritikosAdapter: RetailerAdapter = {
   id: 'kritikos',
-  // The CDN in front of kritikos-sm.gr returns 503/429 to Cloudflare egress IPs; residential works.
-  needsResidentialEgress: true,
+  // The CDN in front of kritikos-sm.gr returns 503/429 to Cloudflare egress IPs,
+  // so the edge never calls this adapter live — it serves Kritikos search from
+  // the D1 catalog index (searchKritikosCatalog) and resolve from it too
+  // (resolveFromCatalog). buildCatalogIndex + scrapeProduct run only off-edge,
+  // from the residential daily scrape, where the CDN answers directly.
 
   async scrapeProduct(url, fetchImpl) {
     const response = await fetchImpl(url, {

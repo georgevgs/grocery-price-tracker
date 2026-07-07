@@ -4,9 +4,6 @@ import { AdapterError, toGreekFloat, type RetailerAdapter } from './types';
 
 const GRAPHQL_URL = 'https://www.ab.gr/api/v1/';
 const BASE_URL = 'https://www.ab.gr';
-// Server-rendered search page (/search 301s here). Reachable through the
-// residential render proxy where the GraphQL API is not — see searchRendered.
-const SEARCH_PAGE_URL = 'https://www.ab.gr/eshop/search';
 const SKU_FROM_URL_PATTERN = /\/p\/(\d+)/;
 const UNIT_LABEL_PATTERN = /([\d.,]+)\s*€\s*\/\s*(\S+)/;
 
@@ -37,22 +34,12 @@ const USER_AGENT = 'Mozilla/5.0 (X11; Linux x86_64) personal-price-watch/1.0';
  */
 export const abAdapter: RetailerAdapter = {
   id: 'ab',
-  needsResidentialEgress: true,
-  // AB's Akamai hard-blocks the residential proxy at the *connection* level on
-  // its /api/v1/ GraphQL endpoint (502 "cannot connect target url", even with a
-  // headless browser pointed straight at the API), while a clean consumer IP
-  // (your home connection / the launchd scrape) gets through. So the two
-  // contexts take different paths to the SAME data:
-  //   • Off-edge scrape (plain fetch, residential IP): the fast, free GraphQL
-  //     API — hints.rendered is unset, so searchProducts/scrapeProduct use it.
-  //   • Edge search/resolve (residential render proxy): the GraphQL API is
-  //     unreachable, but rendering the search *page* works — Akamai's sensor JS
-  //     sets cookies, the in-page app makes its own API call, and the tiles
-  //     paint into the DOM. hints.rendered switches to parsing that HTML.
-  // needsRenderedSearch makes the Worker use render mode (see residential-fetch)
-  // and set hints.rendered for this adapter. Render is slow/pricey, so the D1
-  // search cache matters more here than for any other chain.
-  needsRenderedSearch: true,
+  // No residential-egress/render flags: AB's Akamai WAF 403s Cloudflare's edge,
+  // so the edge never calls this adapter live — it serves AB search and resolve
+  // from the D1 catalog index (searchAbCatalog / resolveFromCatalog in the
+  // Worker, built by buildAbCatalogIndex below). These methods run only OFF-edge,
+  // from the residential daily scrape, where AB's GraphQL answers directly and
+  // free — so they hit the API straight, no render, no proxy.
 
   async scrapeProduct(url, fetchImpl, hints) {
     const skuMatch = url.match(SKU_FROM_URL_PATTERN);
@@ -72,10 +59,7 @@ export const abAdapter: RetailerAdapter = {
       );
     }
 
-    // Propagate the transport so the internal search takes the same path the
-    // caller is on: rendered HTML on the edge, direct GraphQL for the scrape.
-    const searchHints = { rendered: hints?.rendered };
-    const results = await this.searchProducts(query, fetchImpl, searchHints);
+    const results = await this.searchProducts(query, fetchImpl);
     let listing = results.find((result) => sku === result.sku);
 
     // Index churn: generic titles stop surfacing the SKU in the top
@@ -85,7 +69,7 @@ export const abAdapter: RetailerAdapter = {
       const brandQuery = hints?.productBrand?.trim() ?? '';
 
       if (3 <= brandQuery.length && brandQuery !== query) {
-        const brandResults = await this.searchProducts(brandQuery, fetchImpl, searchHints);
+        const brandResults = await this.searchProducts(brandQuery, fetchImpl);
         listing = brandResults.find((result) => sku === result.sku);
       }
     }
@@ -108,15 +92,9 @@ export const abAdapter: RetailerAdapter = {
     };
   },
 
-  async searchProducts(query, fetchImpl, hints) {
-    // Edge path: the GraphQL API is unreachable through the render proxy, so
-    // fetch the rendered search page and parse its product tiles instead.
-    if (true === hints?.rendered) {
-      return searchRendered(query, fetchImpl);
-    }
-
-    // Direct GraphQL — the off-edge scrape (residential IP) and any non-render
-    // caller. One page of tiles; the whole-catalog crawl (buildAbCatalogIndex)
+  async searchProducts(query, fetchImpl) {
+    // Direct GraphQL. Runs off-edge only (residential IP, where AB's API answers
+    // free); one page of tiles. The whole-catalog crawl (buildAbCatalogIndex)
     // reuses the same request via fetchProductSearchPage.
     const page = await fetchProductSearchPage(query, fetchImpl, 0, SEARCH_PAGE_SIZE);
     return page.results;
@@ -302,166 +280,6 @@ const parseUnitLabel = (
     // AB abbreviates ("κιλ"); align with the Sklavenitis label.
     unitLabel: 'κιλ' === match[2] ? 'κιλό' : match[2],
   };
-};
-
-/**
- * Rendered-search path (edge). AB paints results client-side and the GraphQL
- * API is blocked through the proxy, so we render the search page (Scrape.do
- * render=true, wired in residential-fetch) and parse the tiles Scrape.do
- * returns. Fields map 1:1 onto mapSearchResponse so discovery and the off-edge
- * scrape produce identical listings.
- */
-const searchRendered = async (
-  query: string,
-  fetchImpl: typeof fetch,
-): Promise<RetailerSearchResult[]> => {
-  const url = `${SEARCH_PAGE_URL}?q=${encodeURIComponent(query)}`;
-  const response = await fetchImpl(url);
-
-  if (false === response.ok) {
-    throw new AdapterError('ab', url, `HTTP ${response.status} (rendered search)`);
-  }
-
-  return parseRenderedSearch(await response.text());
-};
-
-// Stable per-tile hooks. The styled-components class names (sc-y4jrw3-…) rotate
-// every build and MUST NOT be matched; AB's own data-testid attributes (used by
-// their e2e tests) are the durable anchors. Each is unambiguous because the
-// testid is matched with its closing quote — e.g. "product-block-price" cannot
-// match "product-block-price-per-unit" or "…-supplementary-price".
-const NAME_PATTERN = /data-testid="product-name"[^>]*>([^<]*)</;
-const BRAND_PATTERN = /data-testid="product-brand"[^>]*>([^<]*)</;
-const PRODUCT_ID_PATTERN = /data-testid="product-id"[^>]*>(\d+)</;
-const HREF_PATTERN = /data-testid="product-block-(?:image-link|name-link)"[^>]*?\bhref="([^"]+)"/;
-const IMAGE_PATTERN = /data-testid="product-block-image"[^>]*?\ssrc="([^"]+)"/;
-const PRICE_LABEL_PATTERN = /data-testid="product-block-price"[^>]*?\baria-label="([^"]+)"/;
-const UNIT_PRICE_LABEL_PATTERN = /data-testid="product-block-price-per-unit"[^>]*?\baria-label="([^"]+)"/;
-
-/**
- * Parse AB's rendered search page. Splitting on the exact container testid
- * (note the closing quote — the -image/-price/-name testids share the prefix
- * but not the quote) yields one chunk per product tile.
- */
-export const parseRenderedSearch = (html: string): RetailerSearchResult[] => {
-  const results: RetailerSearchResult[] = [];
-  const seen = new Set<string>();
-  const tiles = html.split('data-testid="product-block"');
-
-  // tiles[0] is the pre-list markup (header/facets) — skip it.
-  for (let index = 1; index < tiles.length; index += 1) {
-    const tile = tiles[index];
-
-    if (undefined === tile) {
-      continue;
-    }
-
-    const result = parseRenderedTile(tile);
-
-    if (null === result || seen.has(result.sku)) {
-      continue;
-    }
-
-    seen.add(result.sku);
-    results.push(result);
-  }
-
-  return results;
-};
-
-const parseRenderedTile = (tile: string): RetailerSearchResult | null => {
-  const href = HREF_PATTERN.exec(tile)?.[1];
-  const sku =
-    PRODUCT_ID_PATTERN.exec(tile)?.[1] ??
-    (undefined !== href ? SKU_FROM_URL_PATTERN.exec(href)?.[1] : undefined);
-
-  if (undefined === sku) {
-    return null;
-  }
-
-  const name = decodeEntities(NAME_PATTERN.exec(tile)?.[1] ?? '').trim();
-
-  if (0 === name.length) {
-    return null;
-  }
-
-  const brand = decodeEntities(BRAND_PATTERN.exec(tile)?.[1] ?? '').trim();
-  const image = IMAGE_PATTERN.exec(tile)?.[1];
-  const unitInfo = parseRenderedUnit(UNIT_PRICE_LABEL_PATTERN.exec(tile)?.[1]);
-  const relativeUrl = href ?? `/el/eshop/p/${sku}`;
-
-  return {
-    retailer: 'ab',
-    sku,
-    title: name,
-    url: relativeUrl.startsWith('http') ? relativeUrl : `${BASE_URL}${relativeUrl}`,
-    brand: 0 < brand.length ? brand : null,
-    ean: null,
-    pricePiece: parseEuroLabel(PRICE_LABEL_PATTERN.exec(tile)?.[1]),
-    priceUnit: unitInfo.priceUnit,
-    unitLabel: unitInfo.unitLabel,
-    imageUrl: undefined !== image ? decodeEntities(image) : null,
-  };
-};
-
-/**
- * AB spells prices out in the tile's aria-label ("Τιμή: 1 ευρώ και 05 λεπτά"),
- * locale-explicit and independent of the split-span digit markup. Whole euros
- * omit the "και … λεπτά" tail.
- */
-const EURO_LABEL_PATTERN = /(\d+)\s*ευρώ(?:\s*και\s*(\d+)\s*λεπτ)?/;
-
-const parseEuroLabel = (raw: string | undefined): number | null => {
-  if (undefined === raw) {
-    return null;
-  }
-
-  const match = EURO_LABEL_PATTERN.exec(raw);
-
-  if (null === match || undefined === match[1]) {
-    return null;
-  }
-
-  const euros = Number(match[1]);
-  const cents = undefined !== match[2] ? Number(match[2]) : 0;
-
-  if (Number.isNaN(euros) || Number.isNaN(cents)) {
-    return null;
-  }
-
-  return euros + cents / 100;
-};
-
-/**
- * "Τιμή τεμαχίου: 1 ευρώ και 05 λεπτά ανά λιτ" → { priceUnit: 1.05,
- * unitLabel: 'λιτ' }. Mirrors parseUnitLabel's 'κιλ' → 'κιλό' folding.
- */
-const parseRenderedUnit = (
-  raw: string | undefined,
-): Pick<RetailerSearchResult, 'priceUnit' | 'unitLabel'> => {
-  if (undefined === raw) {
-    return { priceUnit: null, unitLabel: null };
-  }
-
-  const token = /ανά\s+(\S+)/.exec(raw)?.[1];
-
-  return {
-    priceUnit: parseEuroLabel(raw),
-    unitLabel: undefined === token ? null : 'κιλ' === token ? 'κιλό' : token,
-  };
-};
-
-const ENTITY_MAP = new Map<string, string>([
-  ['&amp;', '&'],
-  ['&lt;', '<'],
-  ['&gt;', '>'],
-  ['&quot;', '"'],
-  ['&#39;', "'"],
-  ['&nbsp;', ' '],
-]);
-
-const decodeEntities = (raw: string): string => {
-  return raw.replace(/&[a-z#0-9]+;/gi, (entity) => ENTITY_MAP.get(entity) ?? entity);
 };
 
 // --- AB catalog discovery index (the off-edge D1 path) ---------------------

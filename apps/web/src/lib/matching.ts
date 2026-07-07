@@ -37,20 +37,6 @@ const EAN_CAPABLE_RETAILERS: ReadonlySet<RetailerId> = new Set<RetailerId>([
 ]);
 
 /**
- * Chains whose edge search runs through the paid headless-render proxy — AB,
- * whose GraphQL API is unreachable through the proxy, so the Worker renders its
- * search PAGE (needsRenderedSearch). That costs ~5× the credits of a plain proxy
- * call and ~20-30s each, and the progressively-looser retry passes below would
- * re-render it up to four times for ONE user search. So these chains run only on
- * the first full pass — one render per search, not four. The off-edge daily
- * scrape reaches AB's API directly and pays nothing, so this trims only the
- * interactive edge fan-out, and never the price tracking of already-linked AB
- * listings. See needsRenderedSearch in @grocery/scrapers and the RENDER MODE
- * note in apps/worker/src/residential-fetch.ts.
- */
-const RENDER_COST_RETAILERS: ReadonlySet<RetailerId> = new Set<RetailerId>(['ab']);
-
-/**
  * Barcode-resolving chains that are also FAST and return a usable product
  * name — used to identify a scanned product before any title is known.
  * Kritikos is deliberately excluded (its search streams the whole ~29 MB
@@ -334,12 +320,8 @@ export const searchAndRank = async (
       continue;
     }
 
-    // Render-cost chains (AB) are excluded from every retry pass: they already
-    // ran on the full pass, and re-rendering them here is the single biggest
-    // proxy expense (one search would otherwise fire up to four AB renders).
     const weakChains = [...ranked.keys()].filter(
-      (retailer) =>
-        topScore(retailer) < SUGGESTION_THRESHOLD && false === RENDER_COST_RETAILERS.has(retailer),
+      (retailer) => topScore(retailer) < SUGGESTION_THRESHOLD,
     );
 
     if (0 === weakChains.length) {
