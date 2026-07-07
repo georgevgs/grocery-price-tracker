@@ -35,8 +35,8 @@ export const ProductView = ({ product, onGoResults, onDeleted }: ProductViewProp
         / ΠΡΟΪΟΝ
       </div>
 
-      <div className="grid grid-cols-1 items-start gap-7 md:grid-cols-[0.9fr_1.1fr]">
-        <div className="flex flex-col gap-4">
+      <div className="grid grid-cols-1 items-start gap-7 md:grid-cols-[minmax(0,0.9fr)_minmax(0,1.1fr)]">
+        <div className="flex min-w-0 flex-col gap-4">
           <ProductImage
             src={product.imageUrl}
             alt={product.title}
@@ -59,7 +59,7 @@ export const ProductView = ({ product, onGoResults, onDeleted }: ProductViewProp
           </div>
         </div>
 
-        <div className="flex flex-col gap-4">
+        <div className="flex min-w-0 flex-col gap-4">
           <CheapestPanel best={best} bestPrice={bestPrice} />
 
           <PriceHistoryChart productId={product.id} />

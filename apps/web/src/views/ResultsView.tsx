@@ -124,7 +124,7 @@ export const ResultsView = ({
         </div>
       )}
 
-      <div className="mt-6 grid grid-cols-1 items-start gap-6 md:grid-cols-[230px_1fr]">
+      <div className="mt-6 grid grid-cols-1 items-start gap-6 md:grid-cols-[230px_minmax(0,1fr)]">
         <aside className="top-[86px] hidden flex-col gap-4 md:sticky md:flex">
           <div className="rounded-2xl border-2 border-ink bg-white p-4">
             <div className="mb-3 font-mono text-[11px] tracking-wide">ΚΑΤΑΣΤΗΜΑΤΑ</div>
@@ -204,7 +204,7 @@ const ResultRowCard = ({ row, isCheapest, onSelect }: ResultRowCardProps) => {
     <button
       type="button"
       onClick={onSelect}
-      className={`relative grid grid-cols-[48px_1fr_auto] items-center gap-3 rounded-2xl border-2 border-ink bg-white px-3.5 py-4 text-left transition-transform hover:translate-x-[3px] sm:grid-cols-[56px_1fr_auto] sm:gap-4 sm:px-[18px] ${
+      className={`relative grid grid-cols-[48px_minmax(0,1fr)_auto] items-center gap-3 rounded-2xl border-2 border-ink bg-white px-3.5 py-4 text-left transition-transform hover:translate-x-[3px] sm:grid-cols-[56px_minmax(0,1fr)_auto] sm:gap-4 sm:px-[18px] ${
         isCheapest ? 'shadow-pop' : ''
       }`}
     >

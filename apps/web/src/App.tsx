@@ -117,7 +117,7 @@ export const App = () => {
         isScraping={isScraping}
       />
 
-      <main className="mx-auto w-full max-w-[1180px] flex-1 px-4 md:px-5">
+      <main className="mx-auto w-full min-w-0 max-w-[1180px] flex-1 px-4 md:px-5">
         {renderView({
           view,
           products,

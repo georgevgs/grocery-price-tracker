@@ -34,7 +34,9 @@ export const ErrorNotice = ({ messages, tone = 'danger' }: ErrorNoticeProps) => 
   const style = TONE_STYLES[tone];
 
   return (
-    <div className={`flex flex-col gap-1.5 rounded-xl border-2 px-3.5 py-2.5 ${style.box}`}>
+    <div
+      className={`flex min-w-0 max-w-full flex-col gap-1.5 rounded-xl border-2 px-3.5 py-2.5 ${style.box}`}
+    >
       {messages.map((message) => (
         <p key={message} className={`flex items-start gap-2 text-sm ${style.text}`}>
           <span aria-hidden className="mt-px flex-none font-mono font-bold leading-none">

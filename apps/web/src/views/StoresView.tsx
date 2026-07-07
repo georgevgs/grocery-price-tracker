@@ -36,7 +36,7 @@ export const StoresView = ({ products, onGoHome, onPickRetailer }: StoresViewPro
         </span>
       </h1>
 
-      <div className="grid grid-cols-1 items-start gap-6 md:grid-cols-[0.85fr_1.15fr]">
+      <div className="grid grid-cols-1 items-start gap-6 md:grid-cols-[minmax(0,0.85fr)_minmax(0,1.15fr)]">
         <div className="flex flex-col gap-4 rounded-2xl border-2 border-ink bg-ink px-6 py-6 text-white shadow-hard-accent md:sticky md:top-[86px]">
           <div className="font-mono text-[11px] tracking-[0.15em] text-[#b9b9b0]">
             ΚΑΛΥΨΗ
