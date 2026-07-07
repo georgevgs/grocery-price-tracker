@@ -12,6 +12,7 @@ import type {
 } from '@grocery/core/types';
 import { adapterRegistry } from '@grocery/scrapers/registry';
 import { queryTokens } from '@grocery/scrapers/kritikos';
+import { abQueryTokens } from '@grocery/scrapers/ab';
 import type { RetailerAdapter, SearchHints } from '@grocery/scrapers/types';
 import { athensDate, runScrape, type Env } from './scrape';
 import { makeResidentialFetch } from './residential-fetch';
@@ -218,6 +219,19 @@ app.get('/api/retailer-search', async (c) => {
     // consult; the query itself is the cheap part.
     if ('kritikos' === adapter.id) {
       return searchKritikosCatalog(c.env, query, eanHint);
+    }
+
+    // AB: same off-edge D1-index treatment as Kritikos (its Akamai WAF 403s the
+    // edge and its API is blocked through the proxy too, so live edge search
+    // means the priciest Scrape.do render tier). searchAbCatalog returns null
+    // until the daily crawl has populated ab_catalog, so during rollout we fall
+    // through to the live proxy search; once populated it serves AB for free.
+    if ('ab' === adapter.id) {
+      const indexed = await searchAbCatalog(c.env, query);
+
+      if (null !== indexed) {
+        return indexed;
+      }
     }
 
     const cached = await readSearchCache(c.env, adapter.id, query, eanKey);
@@ -858,6 +872,81 @@ const searchKritikosCatalog = async (
     return [...exact, ...text.filter((result) => false === seen.has(result.sku))];
   } catch {
     return [];
+  }
+};
+
+interface AbCatalogRow {
+  sku: string;
+  name: string;
+  url: string;
+  brand: string | null;
+  price_piece: number | null;
+  price_unit: number | null;
+  unit_label: string | null;
+  image_url: string | null;
+}
+
+const AB_MAX_RESULTS = 100;
+const AB_COLUMNS = 'sku, name, url, brand, price_piece, price_unit, unit_label, image_url';
+
+const abRowToResult = (row: AbCatalogRow): RetailerSearchResult => ({
+  retailer: 'ab',
+  sku: row.sku,
+  title: row.name,
+  url: row.url,
+  brand: row.brand,
+  ean: null,
+  pricePiece: row.price_piece,
+  priceUnit: row.price_unit,
+  unitLabel: row.unit_label,
+  imageUrl: row.image_url,
+});
+
+/**
+ * Answer an AB search from the D1 discovery index (built off-edge — schema.sql,
+ * scrape-local.ts) instead of the paid Scrape.do render path. Each query token
+ * becomes a `haystack LIKE ?` AND-term (same fold as the client matcher, via the
+ * shared abQueryTokens), mirroring searchKritikosCatalog. AB carries no barcode,
+ * so there is no EAN branch.
+ *
+ * Returns null — NOT [] — when the index is empty or the table is missing (not
+ * crawled yet / not migrated), so searchOne can fall back to the live proxy
+ * search during the rollout window. Once the daily job has populated ab_catalog,
+ * this serves every AB search for free. A genuine no-match returns []. Never
+ * throws — this path must not 5xx.
+ */
+const searchAbCatalog = async (
+  env: Env,
+  query: string,
+): Promise<RetailerSearchResult[] | null> => {
+  try {
+    // Empty/unmigrated index → signal "fall back to live search" (null), never
+    // a false "no products" ([]). One cheap probe row distinguishes the two.
+    const probe = await env.DB.prepare('SELECT 1 FROM ab_catalog LIMIT 1').first();
+
+    if (null === probe || undefined === probe) {
+      return null;
+    }
+
+    const tokens = abQueryTokens(query);
+
+    if (0 === tokens.length) {
+      return [];
+    }
+
+    const clause = tokens
+      .map(() => `haystack LIKE ('%' || ? || '%') ESCAPE '\\'`)
+      .join(' AND ');
+    const { results } = await env.DB.prepare(
+      `SELECT ${AB_COLUMNS} FROM ab_catalog WHERE ${clause} LIMIT ?`,
+    )
+      .bind(...tokens.map(escapeLike), AB_MAX_RESULTS)
+      .all<AbCatalogRow>();
+
+    return results.map(abRowToResult);
+  } catch {
+    // Table missing (not migrated yet) or any query error → fall back to live.
+    return null;
   }
 };
 

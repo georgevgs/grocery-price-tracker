@@ -105,3 +105,36 @@ CREATE TABLE IF NOT EXISTS kritikos_catalog (
     image_url   TEXT,
     indexed_at  TEXT NOT NULL DEFAULT (datetime('now'))
 );
+
+-- AB discovery index. AB's Akamai WAF hard-blocks Cloudflare's egress IPs (403
+-- on every Worker fetch) AND its GraphQL API is unreachable through the
+-- residential proxy, so the edge could only reach AB via the paid Scrape.do
+-- render tier (the priciest, slowest one). AB is SAP Hybris with an empty-
+-- free-text catalog browse, so — exactly like kritikos_catalog above — the
+-- off-edge daily scrape (residential IP, no block, no CPU limit) crawls AB's
+-- whole ~12k-product catalog into these rows once a day, and the edge answers
+-- AB search with a cheap `haystack LIKE ?` (searchAbCatalog in index.ts). No
+-- proxy fetch, no render credits.
+--
+-- `haystack` is the folded brand + name (abHaystack — the same @grocery/core
+-- comparison fold the client matcher uses, so an indexed row matches the same
+-- queries); `url` is prebuilt so a row maps straight to a search result. No
+-- barcode column: AB exposes no EAN. `indexed_at` is stamped on every upsert so
+-- rows a later run doesn't re-touch (products dropped from the catalog) are
+-- pruned by a trailing DELETE.
+--
+-- Pure cache: safe to drop and let the next scrape repopulate. Missing/empty →
+-- searchAbCatalog returns null and the edge falls back to the live search rather
+-- than 5xx-ing.
+CREATE TABLE IF NOT EXISTS ab_catalog (
+    sku         TEXT PRIMARY KEY,
+    name        TEXT NOT NULL,
+    url         TEXT NOT NULL,
+    haystack    TEXT NOT NULL,
+    brand       TEXT,
+    price_piece REAL,
+    price_unit  REAL,
+    unit_label  TEXT,
+    image_url   TEXT,
+    indexed_at  TEXT NOT NULL DEFAULT (datetime('now'))
+);

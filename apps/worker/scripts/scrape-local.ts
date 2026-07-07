@@ -26,6 +26,7 @@ import { fileURLToPath } from 'node:url';
 import type { RetailerId } from '@grocery/core/types';
 import { adapterRegistry } from '@grocery/scrapers/registry';
 import { buildCatalogIndex, type KritikosCatalogEntry } from '@grocery/scrapers/kritikos';
+import { buildAbCatalogIndex, type AbCatalogEntry } from '@grocery/scrapers/ab';
 import { scrapeFailureOutcome, unitPriceSanityWarning } from '../src/scrape';
 
 const WORKER_DIR = join(dirname(fileURLToPath(import.meta.url)), '..');
@@ -293,6 +294,70 @@ const runCatalogIndex = async (indexedAt: string): Promise<void> => {
   }
 };
 
+// --- AB catalog index -------------------------------------------------------
+//
+// AB blocks Cloudflare's edge (403) AND its API is unreachable through the proxy,
+// so the edge could only reach AB via the paid Scrape.do render tier. This
+// residential job reaches AB's GraphQL directly and free, so — exactly like the
+// Kritikos index above — it crawls AB's whole catalog once a day into ab_catalog,
+// and the edge answers AB search with a cheap LIKE (searchAbCatalog in index.ts).
+// Same batched-upsert-then-prune-stale contract; same self-contained try/catch so
+// an AB failure never sinks the price scrape or the Kritikos index.
+
+const AB_CATALOG_CHUNK = 200;
+
+const abCatalogInsert = (entry: AbCatalogEntry, indexedAt: string): string => {
+  return (
+    'INSERT OR REPLACE INTO ab_catalog ' +
+    '(sku, name, url, haystack, brand, price_piece, price_unit, unit_label, image_url, indexed_at) ' +
+    `VALUES (${sqlStr(entry.sku)}, ${sqlStr(entry.name)}, ${sqlStr(entry.url)}, ${sqlStr(entry.haystack)}, ` +
+    `${sqlStr(entry.brand)}, ${sqlNum(entry.pricePiece)}, ${sqlNum(entry.priceUnit)}, ` +
+    `${sqlStr(entry.unitLabel)}, ${sqlStr(entry.imageUrl)}, ${sqlStr(indexedAt)});`
+  );
+};
+
+const writeAbCatalogIndex = (entries: readonly AbCatalogEntry[], indexedAt: string): void => {
+  const statements = entries.map((entry) => abCatalogInsert(entry, indexedAt));
+
+  for (let start = 0; start < statements.length; start += AB_CATALOG_CHUNK) {
+    const chunk = statements.slice(start, start + AB_CATALOG_CHUNK);
+    writeResults(chunk.join('\n'));
+    console.log(`[scrape-local]   indexed ${Math.min(start + chunk.length, statements.length)}/${statements.length} (ab)`);
+  }
+
+  // Same prune-stale as the Kritikos index: this run stamped every current row
+  // with indexedAt, so anything older dropped out of the catalog. Runs only after
+  // every insert chunk succeeded (execFileSync throws otherwise).
+  writeResults(`DELETE FROM ab_catalog WHERE indexed_at < ${sqlStr(indexedAt)};`);
+};
+
+const runAbCatalogIndex = async (indexedAt: string): Promise<void> => {
+  try {
+    console.log('[scrape-local] building AB catalog index...');
+    const entries = await buildAbCatalogIndex(fetch);
+    console.log(`[scrape-local] AB catalog: ${entries.length} product(s)`);
+
+    if (DRY_RUN) {
+      const sample = entries.slice(0, 3).map((entry) => `  - ${entry.sku} ${entry.name}`).join('\n');
+      console.log(`[scrape-local] dry run — would index ${entries.length} AB product(s):\n${sample}`);
+      return;
+    }
+
+    if (0 === entries.length) {
+      // Never prune against an empty crawl — that would wipe the whole index.
+      console.log('[scrape-local] AB catalog came back empty — leaving the existing index in place.');
+      return;
+    }
+
+    writeAbCatalogIndex(entries, indexedAt);
+    console.log('[scrape-local] AB catalog index updated.');
+  } catch (error) {
+    console.error(
+      `[scrape-local] AB catalog index failed (prices unaffected): ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+};
+
 /** Write today's prices and image backfills — no-op when there's nothing to write. */
 const writePrices = (
   prices: readonly PriceWrite[],
@@ -344,9 +409,12 @@ const main = async (): Promise<void> => {
 
   writePrices(prices, images, scrapedDate, scrapedAt);
 
-  // The catalog index is discovery data, independent of the tracked listings
-  // above, so it rebuilds every run regardless of whether any price was written.
+  // The catalog indexes are discovery data, independent of the tracked listings
+  // above, so they rebuild every run regardless of whether any price was written.
+  // Each is self-contained (its own try/catch), so one failing never sinks the
+  // other or the prices already written.
   await runCatalogIndex(scrapedAt);
+  await runAbCatalogIndex(scrapedAt);
 };
 
 main().catch((error: unknown) => {

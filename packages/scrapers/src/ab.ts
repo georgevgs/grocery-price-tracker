@@ -1,4 +1,5 @@
 import type { RetailerSearchResult } from '@grocery/core/types';
+import { normalizeTitle } from '@grocery/core/normalize';
 import { AdapterError, toGreekFloat, type RetailerAdapter } from './types';
 
 const GRAPHQL_URL = 'https://www.ab.gr/api/v1/';
@@ -114,44 +115,73 @@ export const abAdapter: RetailerAdapter = {
       return searchRendered(query, fetchImpl);
     }
 
-    const variables = {
-      lang: 'gr',
-      searchQuery: query,
-      pageNumber: 0,
-      pageSize: 20,
-      filterFlag: true,
-      fields: 'PRODUCT_TILE',
-      plainChildCategories: true,
-      useSpellingSuggestion: true,
-    };
-    const extensions = {
-      persistedQuery: { version: 1, sha256Hash: PRODUCT_SEARCH_HASH },
-    };
-
-    const params = new URLSearchParams({
-      operationName: 'GetProductSearch',
-      variables: JSON.stringify(variables),
-      extensions: JSON.stringify(extensions),
-    });
-    const url = `${GRAPHQL_URL}?${params.toString()}`;
-
-    const response = await fetchImpl(url, {
-      headers: {
-        'User-Agent': USER_AGENT,
-        Accept: 'application/json',
-        // Apollo Server's CSRF guard 400s GETs without one of these.
-        'x-apollo-operation-name': 'GetProductSearch',
-      },
-    });
-
-    if (false === response.ok) {
-      throw new AdapterError('ab', url, `HTTP ${response.status}`);
-    }
-
-    const body: unknown = await response.json();
-
-    return mapSearchResponse(body, url);
+    // Direct GraphQL — the off-edge scrape (residential IP) and any non-render
+    // caller. One page of tiles; the whole-catalog crawl (buildAbCatalogIndex)
+    // reuses the same request via fetchProductSearchPage.
+    const page = await fetchProductSearchPage(query, fetchImpl, 0, SEARCH_PAGE_SIZE);
+    return page.results;
   },
+};
+
+/** GetProductSearch page size for live search. The catalog crawl pages larger. */
+const SEARCH_PAGE_SIZE = 20;
+
+interface ProductSearchPage {
+  results: RetailerSearchResult[];
+  /** From the response's `pagination.totalPages` — drives the catalog crawl loop. */
+  totalPages: number;
+}
+
+/**
+ * Fetch and parse ONE page of GetProductSearch. Shared by live search (page 0)
+ * and the off-edge catalog crawl (every page), so both hit the exact same
+ * request shape / CSRF header / persisted hash and build identical listings via
+ * mapSearchResponse. Throws on a non-2xx (the caller surfaces it as a per-chain
+ * error / a failed crawl).
+ */
+const fetchProductSearchPage = async (
+  query: string,
+  fetchImpl: typeof fetch,
+  pageNumber: number,
+  pageSize: number,
+): Promise<ProductSearchPage> => {
+  const variables = {
+    lang: 'gr',
+    searchQuery: query,
+    pageNumber,
+    pageSize,
+    filterFlag: true,
+    fields: 'PRODUCT_TILE',
+    plainChildCategories: true,
+    useSpellingSuggestion: true,
+  };
+  const extensions = {
+    persistedQuery: { version: 1, sha256Hash: PRODUCT_SEARCH_HASH },
+  };
+
+  const params = new URLSearchParams({
+    operationName: 'GetProductSearch',
+    variables: JSON.stringify(variables),
+    extensions: JSON.stringify(extensions),
+  });
+  const url = `${GRAPHQL_URL}?${params.toString()}`;
+
+  const response = await fetchImpl(url, {
+    headers: {
+      'User-Agent': USER_AGENT,
+      Accept: 'application/json',
+      // Apollo Server's CSRF guard 400s GETs without one of these.
+      'x-apollo-operation-name': 'GetProductSearch',
+    },
+  });
+
+  if (false === response.ok) {
+    throw new AdapterError('ab', url, `HTTP ${response.status}`);
+  }
+
+  const body: unknown = await response.json();
+
+  return { results: mapSearchResponse(body, url), totalPages: extractTotalPages(body) };
 };
 
 interface JsonObject {
@@ -432,4 +462,118 @@ const ENTITY_MAP = new Map<string, string>([
 
 const decodeEntities = (raw: string): string => {
   return raw.replace(/&[a-z#0-9]+;/gi, (entity) => ENTITY_MAP.get(entity) ?? entity);
+};
+
+// --- AB catalog discovery index (the off-edge D1 path) ---------------------
+//
+// AB's Akamai hard-blocks Cloudflare's egress IPs (403 on every Worker fetch,
+// re-verified 2026-07-07) AND its GraphQL API is unreachable through the
+// residential proxy, so the edge could previously only reach AB via Scrape.do's
+// priciest render tier. So AB gets the same treatment as Kritikos: the off-edge
+// daily scrape (residential IP, where AB's API answers directly and free) crawls
+// the whole catalog into a D1 table once a day, and the edge answers AB search
+// with a cheap `haystack LIKE ?` over ~12k rows — no proxy, no render, no credits
+// (searchAbCatalog in apps/worker/src/index.ts).
+
+/**
+ * Whole-catalog crawl controls. AB is SAP Hybris: an EMPTY free-text query with
+ * the ":relevance" sort browses EVERY product (verified live 2026-07-07:
+ * ~12,100 results), and `pageSize` is capped just under 100 (100 → HTTP 500
+ * "UserInputError"), so we page at 50. Used only off-edge — the edge never crawls.
+ */
+const CATALOG_QUERY = ':relevance';
+const CATALOG_PAGE_SIZE = 50;
+/** Backstop so a bogus totalPages can't loop forever (~12k/50 ≈ 243 real pages). */
+const CATALOG_MAX_PAGES = 1000;
+
+const extractTotalPages = (body: unknown): number => {
+  const data = isObject(body) ? body['data'] : undefined;
+  const productSearch = isObject(data) ? data['productSearch'] : undefined;
+  const pagination = isObject(productSearch) ? productSearch['pagination'] : undefined;
+  const totalPages = isObject(pagination) ? pagination['totalPages'] : undefined;
+
+  return 'number' === typeof totalPages && 0 < totalPages ? totalPages : 1;
+};
+
+/**
+ * The folded string an AB query's tokens are LIKE-matched against: brand + name
+ * in @grocery/core's shared comparison form (normalizeTitle), so the D1 index and
+ * the client-side matcher fold identically and an indexed row matches the same
+ * queries the live search would.
+ */
+export const abHaystack = (brand: string | null, name: string): string =>
+  normalizeTitle(`${brand ?? ''} ${name}`.trim());
+
+/**
+ * Tokenize a query into the AND-terms matched against an AB catalog haystack.
+ * Same fold as abHaystack so both sides agree; drops empty tokens. Shared by the
+ * edge index query (index.ts) and this module so they tokenize identically.
+ */
+export const abQueryTokens = (query: string): string[] =>
+  normalizeTitle(query)
+    .split(' ')
+    .filter((token) => 0 < token.length);
+
+/** One AB product flattened for the D1 discovery index (AB carries no EAN/barcode). */
+export interface AbCatalogEntry {
+  sku: string;
+  name: string;
+  url: string;
+  /** Folded brand + name — the LIKE target (see abHaystack). */
+  haystack: string;
+  brand: string | null;
+  pricePiece: number | null;
+  priceUnit: number | null;
+  unitLabel: string | null;
+  imageUrl: string | null;
+}
+
+const toAbCatalogEntry = (result: RetailerSearchResult): AbCatalogEntry => ({
+  sku: result.sku,
+  name: result.title,
+  url: result.url,
+  haystack: abHaystack(result.brand, result.title),
+  brand: result.brand,
+  pricePiece: result.pricePiece,
+  priceUnit: result.priceUnit,
+  unitLabel: result.unitLabel,
+  imageUrl: result.imageUrl ?? null,
+});
+
+/**
+ * Crawl AB's WHOLE catalog into index entries — the off-edge counterpart to
+ * searchProducts, run from a residential IP by the daily scrape (where AB's
+ * GraphQL answers directly and free). Pages the empty-free-text browse
+ * (CATALOG_QUERY) at CATALOG_PAGE_SIZE until every page is read, deduping by SKU
+ * (a product can recur across pages as the backing result set shifts). Reuses
+ * mapSearchResponse via fetchProductSearchPage so index rows match live-search
+ * listings field-for-field. Sequential on purpose — one gentle daily crawl, not
+ * a burst that trips AB's WAF.
+ */
+export const buildAbCatalogIndex = async (
+  fetchImpl: typeof fetch,
+): Promise<AbCatalogEntry[]> => {
+  const entries: AbCatalogEntry[] = [];
+  const seen = new Set<string>();
+
+  const collect = (results: readonly RetailerSearchResult[]): void => {
+    for (const result of results) {
+      if (false === seen.has(result.sku)) {
+        seen.add(result.sku);
+        entries.push(toAbCatalogEntry(result));
+      }
+    }
+  };
+
+  const first = await fetchProductSearchPage(CATALOG_QUERY, fetchImpl, 0, CATALOG_PAGE_SIZE);
+  collect(first.results);
+
+  const totalPages = Math.min(first.totalPages, CATALOG_MAX_PAGES);
+
+  for (let pageNumber = 1; pageNumber < totalPages; pageNumber += 1) {
+    const page = await fetchProductSearchPage(CATALOG_QUERY, fetchImpl, pageNumber, CATALOG_PAGE_SIZE);
+    collect(page.results);
+  }
+
+  return entries;
 };

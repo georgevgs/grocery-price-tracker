@@ -8,7 +8,13 @@ import {
 } from '../packages/core/src/normalize';
 import { suggestMatches } from '../packages/core/src/match';
 import { parseProductHtml, parseSearchHtml } from '../packages/scrapers/src/sklavenitis';
-import { mapSearchResponse, parseRenderedSearch } from '../packages/scrapers/src/ab';
+import {
+  abHaystack,
+  abQueryTokens,
+  buildAbCatalogIndex,
+  mapSearchResponse,
+  parseRenderedSearch,
+} from '../packages/scrapers/src/ab';
 import { toGreekFloat } from '../packages/scrapers/src/types';
 import {
   mapSearchResponse as mapLidlSearchResponse,
@@ -263,6 +269,81 @@ assert.equal(
 assert.throws(() => {
   mapSearchResponse({ errors: [{ message: 'PersistedQueryNotFound' }] }, 'test://fixture');
 }, /PersistedQueryNotFound/);
+
+// --- ab catalog index (the off-edge D1 discovery path) -------------------
+
+// abQueryTokens and abHaystack share @grocery/core's normalizeTitle, so the D1
+// index and the edge query fold identically (punctuation → spaces, homoglyphs
+// folded), which is the whole point: an indexed row matches the same queries.
+assert.deepEqual(abQueryTokens('   '), []);
+assert.equal(abQueryTokens('Γάλα & Φρέσκο').length, 2); // '&' folds away, no empty token
+// Homoglyph fold makes the Greek-script brand and a Latin-typed query agree.
+assert.ok(abQueryTokens('ΝΟΥΝΟΥ').every((token) => abHaystack('ΝΟΥΝΟΥ', 'Γάλα').includes(token)));
+
+// buildAbCatalogIndex pages the empty-free-text browse to its pagination.totalPages
+// and dedupes by SKU (a product recurs across pages as the backing set shifts).
+const abCatalogPage = (pageNumber: number) => ({
+  data: {
+    productSearch: {
+      pagination: { currentPage: pageNumber, totalResults: 3, totalPages: 2 },
+      products:
+        0 === pageNumber
+          ? [
+              {
+                code: '100',
+                name: 'Γάλα Φρέσκο Πλήρες 1lt',
+                url: '/el/eshop/gala-fresko-plires-1lt/p/100',
+                manufacturerName: 'ΝΟΥΝΟΥ',
+                price: { value: 1.55, supplementaryPriceLabel1: '1,55 €/ λιτ' },
+              },
+              {
+                code: '200',
+                name: 'Ψωμί Τοστ 720g',
+                url: '/el/eshop/psomi-tost-720g/p/200',
+                manufacturerName: '7DAYS',
+                price: { value: 1.2 },
+              },
+            ]
+          : [
+              // sku 200 repeats — must be deduped, not double-counted.
+              {
+                code: '200',
+                name: 'Ψωμί Τοστ 720g',
+                url: '/el/eshop/psomi-tost-720g/p/200',
+                manufacturerName: '7DAYS',
+                price: { value: 1.2 },
+              },
+              {
+                code: '300',
+                name: 'Τυρί Φέτα ΠΟΠ 400g',
+                url: '/el/eshop/tyri-feta-pop-400g/p/300',
+                manufacturerName: 'ΔΩΔΩΝΗ',
+                price: { value: 4.1 },
+              },
+            ],
+    },
+  },
+});
+const abCatalogFetch = (async (input: Parameters<typeof fetch>[0]) => {
+  const url = 'string' === typeof input ? input : input.toString();
+  const rawVars = new URL(url).searchParams.get('variables') ?? '{}';
+  const pageNumber = Number(JSON.parse(rawVars).pageNumber ?? 0);
+  return new Response(JSON.stringify(abCatalogPage(pageNumber)));
+}) as typeof fetch;
+
+const abIndex = await buildAbCatalogIndex(abCatalogFetch);
+assert.equal(abIndex.length, 3); // 4 tiles across 2 pages, sku 200 deduped
+
+const abMilk = abIndex.find((entry) => '100' === entry.sku);
+assert.ok(undefined !== abMilk);
+assert.equal(abMilk.name, 'Γάλα Φρέσκο Πλήρες 1lt');
+assert.equal(abMilk.brand, 'ΝΟΥΝΟΥ');
+assert.equal(abMilk.pricePiece, 1.55);
+assert.equal(abMilk.priceUnit, 1.55);
+assert.equal(abMilk.unitLabel, 'λιτ');
+assert.equal(abMilk.url, 'https://www.ab.gr/el/eshop/gala-fresko-plires-1lt/p/100');
+// The row's haystack matches the same tokens a user's query folds to.
+assert.ok(abQueryTokens('Γάλα Φρέσκο').every((token) => abMilk.haystack.includes(token)));
 
 // --- ab rendered-search parser (edge path) -------------------------------
 // Trimmed from the live rendered page: only the stable data-testid hooks the
