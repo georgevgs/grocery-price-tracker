@@ -189,9 +189,25 @@ app.get('/api/retailer-search', async (c) => {
   const fetchFor = (adapter: RetailerAdapter): typeof fetch =>
     true === adapter.needsResidentialEgress && undefined !== residentialFetch ? residentialFetch : fetch;
 
-  const outcomes = await Promise.allSettled(
-    adapters.map((adapter) => adapter.searchProducts(query, fetchFor(adapter), hints)),
-  );
+  // '' when no EAN hint — part of the cache key so an EAN-guided search (which
+  // surfaces the exact product first) never collides with the plain query.
+  const eanKey = hints?.ean ?? '';
+
+  const searchOne = async (adapter: RetailerAdapter): Promise<RetailerSearchResult[]> => {
+    const cached = await readSearchCache(c.env, adapter.id, query, eanKey);
+
+    if (null !== cached) {
+      return cached;
+    }
+
+    // A throw here (blocked/failed chain) skips the write below and surfaces in
+    // errors[], so failures always retry live and never poison the cache.
+    const found = await adapter.searchProducts(query, fetchFor(adapter), hints);
+    await writeSearchCache(c.env, adapter.id, query, eanKey, found);
+    return found;
+  };
+
+  const outcomes = await Promise.allSettled(adapters.map(searchOne));
 
   const results: Partial<Record<RetailerId, RetailerSearchResult[]>> = {};
   const errors: string[] = [];
@@ -602,6 +618,64 @@ const writeBarcodeCache = async (env: Env, ean: string, info: BarcodeInfo): Prom
   )
     .bind(ean, info.name, info.brand, info.quantity, info.imageUrl, null !== info.name ? 1 : 0)
     .run();
+};
+
+/**
+ * How long a cached retailer search stays servable. Discovery listings change
+ * slowly, so a few hours spares the residential scraping API most repeat
+ * queries (the whole point — those chains bill per request) while keeping
+ * results fresh enough. Enforced in the read below via datetime('now', ...).
+ */
+const SEARCH_CACHE_TTL = '-6 hours';
+
+/**
+ * Both helpers are best-effort: any DB error — most importantly the table not
+ * being migrated yet — degrades to null/no-op so search always falls through to
+ * a live fetch. Never throws into the search fan-out.
+ */
+const readSearchCache = async (
+  env: Env,
+  retailer: RetailerId,
+  query: string,
+  ean: string,
+): Promise<RetailerSearchResult[] | null> => {
+  try {
+    const row = await env.DB.prepare(
+      `SELECT results FROM search_cache
+       WHERE retailer = ? AND query = ? AND ean = ?
+         AND cached_at > datetime('now', ?)`,
+    )
+      .bind(retailer, query, ean, SEARCH_CACHE_TTL)
+      .first<{ results: string }>();
+
+    if (null === row || undefined === row) {
+      return null;
+    }
+
+    const parsed: unknown = JSON.parse(row.results);
+    return Array.isArray(parsed) ? (parsed as RetailerSearchResult[]) : null;
+  } catch {
+    return null;
+  }
+};
+
+const writeSearchCache = async (
+  env: Env,
+  retailer: RetailerId,
+  query: string,
+  ean: string,
+  results: RetailerSearchResult[],
+): Promise<void> => {
+  try {
+    await env.DB.prepare(
+      `INSERT OR REPLACE INTO search_cache (retailer, query, ean, results, cached_at)
+       VALUES (?, ?, ?, ?, datetime('now'))`,
+    )
+      .bind(retailer, query, ean, JSON.stringify(results))
+      .run();
+  } catch {
+    // A cache write must never fail the search — swallow and move on.
+  }
 };
 
 const groupListingsByProduct = (

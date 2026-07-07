@@ -53,3 +53,22 @@ CREATE TABLE IF NOT EXISTS barcode_cache (
     found     INTEGER NOT NULL,
     cached_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
+
+-- Memoized retailer search results, keyed by (retailer, query, EAN hint).
+-- Its reason for existing is cost: the chains flagged needsResidentialEgress
+-- fan out through a paid residential scraping API (see residential-fetch.ts),
+-- so serving a repeat query from here instead of re-hitting the provider is
+-- what keeps usage inside the free tier (it also spares every chain a live
+-- round-trip). Catalog listings change slowly, so a short TTL — enforced in
+-- the read query, not stored — keeps discovery fresh enough. Only successful
+-- results are ever written, so a blocked/transient chain never caches a miss.
+-- Pure cache: safe to drop and let it repopulate; if the table is missing
+-- entirely, search still works — the helpers swallow the error and fetch live.
+CREATE TABLE IF NOT EXISTS search_cache (
+    retailer  TEXT NOT NULL,
+    query     TEXT NOT NULL,
+    ean       TEXT NOT NULL DEFAULT '',
+    results   TEXT NOT NULL,
+    cached_at TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (retailer, query, ean)
+);
