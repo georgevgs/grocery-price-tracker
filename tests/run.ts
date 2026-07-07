@@ -8,7 +8,7 @@ import {
 } from '../packages/core/src/normalize';
 import { suggestMatches } from '../packages/core/src/match';
 import { parseProductHtml, parseSearchHtml } from '../packages/scrapers/src/sklavenitis';
-import { mapSearchResponse } from '../packages/scrapers/src/ab';
+import { mapSearchResponse, parseRenderedSearch } from '../packages/scrapers/src/ab';
 import { toGreekFloat } from '../packages/scrapers/src/types';
 import {
   mapSearchResponse as mapLidlSearchResponse,
@@ -259,6 +259,67 @@ assert.equal(
 assert.throws(() => {
   mapSearchResponse({ errors: [{ message: 'PersistedQueryNotFound' }] }, 'test://fixture');
 }, /PersistedQueryNotFound/);
+
+// --- ab rendered-search parser (edge path) -------------------------------
+// Trimmed from the live rendered page: only the stable data-testid hooks the
+// parser anchors on, plus decoy testids (supplementary-price, price-per-unit,
+// image-link) that share the "product-block-price"/"…-image" prefix and must
+// NOT be mis-matched. Parity with the GraphQL mapper above is the contract:
+// same sku/title/brand/price/unit, so discovery and the off-edge scrape agree.
+const AB_RENDERED_FIXTURE = `
+<ul data-testid="search-results-list-wrapper">
+  <li class="sc-3brks3-4 jpLtXo product-item">
+    <div data-testid="product-block" class="sc-y4jrw3-5 jCVKJG">
+      <a aria-label="ΑΒ ΕΠΙΛΟΓΗ Γάλα Υψηλής Θερμικής Επεξεργασίας Πλήρες 1lt" data-testid="product-block-image-link" tabindex="0" href="/el/eshop/Gala/p/7344931" class="sc-y4jrw3-7 jsYytP">
+        <img data-testid="product-block-image" src="https://static.ab.gr/medias/x1.jpg?buildNumber=abc&amp;imwidth=300" alt="">
+      </a>
+      <h3 data-testid="styled-title"><a data-testid="product-block-name-link" title="…" href="/el/eshop/Gala/p/7344931">
+        <span data-testid="product-brand">ΑΒ ΕΠΙΛΟΓΗ </span><span data-testid="product-name">Γάλα Υψηλής Θερμικής Επεξεργασίας Πλήρες 1lt</span>
+      </a></h3>
+      <div data-testid="product-block-supplementary-price" aria-label="1 λιτ"><span>1 λιτ</span></div>
+      <div data-testid="product-block-price-per-unit" aria-label="Τιμή τεμαχίου: 1 ευρώ και 05 λεπτά ανά λιτ"><span>€</span><span>1</span><sup>05</sup><span>/λιτ</span></div>
+      <div data-testid="product-block-price" aria-label="Τιμή: 1 ευρώ και 05 λεπτά"><div>€</div><div>1</div><sup>05</sup></div>
+      <div data-testid="product-id">7344931</div>
+      <div data-testid="search-position">1</div>
+    </div>
+  </li>
+  <li class="sc-3brks3-4 jpLtXo product-item">
+    <div data-testid="product-block" class="sc-y4jrw3-5 jCVKJG">
+      <a aria-label="ΑΒ Γάλα Συμπυκνωμένο Ελαφρύ 400g" data-testid="product-block-image-link" tabindex="0" href="/el/eshop/Gala-Sympyknomeno/p/7579721" class="sc-y4jrw3-7 jsYytP">
+        <img data-testid="product-block-image" src="https://static.ab.gr/medias/x2.jpg?imwidth=300" alt="">
+      </a>
+      <h3 data-testid="styled-title"><a data-testid="product-block-name-link" title="…" href="/el/eshop/Gala-Sympyknomeno/p/7579721">
+        <span data-testid="product-brand">ΑΒ </span><span data-testid="product-name">Γάλα Συμπυκνωμένο Ελαφρύ 400g</span>
+      </a></h3>
+      <div data-testid="product-block-supplementary-price" aria-label="400 γρ"><span>400 γρ</span></div>
+      <div data-testid="product-block-price-per-unit" aria-label="Τιμή τεμαχίου: 2 ευρώ και 08 λεπτά ανά κιλ"><span>€</span><span>2</span><sup>08</sup><span>/κιλ</span></div>
+      <div data-testid="product-block-price" aria-label="Τιμή: 0 ευρώ και 83 λεπτά"><div>€</div><div>0</div><sup>83</sup></div>
+      <div data-testid="product-id">7579721</div>
+      <div data-testid="search-position">2</div>
+    </div>
+  </li>
+</ul>`;
+
+const abRendered = parseRenderedSearch(AB_RENDERED_FIXTURE);
+assert.equal(abRendered.length, 2);
+const [abRender0, abRender1] = abRendered;
+assert.ok(undefined !== abRender0 && undefined !== abRender1);
+// Tile 1: 1lt milk — brand split from name, price from the aria-label, image entity-decoded.
+assert.equal(abRender0.sku, '7344931');
+assert.equal(abRender0.title, 'Γάλα Υψηλής Θερμικής Επεξεργασίας Πλήρες 1lt');
+assert.equal(abRender0.brand, 'ΑΒ ΕΠΙΛΟΓΗ');
+assert.equal(abRender0.pricePiece, 1.05);
+assert.equal(abRender0.priceUnit, 1.05);
+assert.equal(abRender0.unitLabel, 'λιτ');
+assert.equal(abRender0.ean, null);
+assert.equal(abRender0.url, 'https://www.ab.gr/el/eshop/Gala/p/7344931');
+assert.equal(abRender0.imageUrl, 'https://static.ab.gr/medias/x1.jpg?buildNumber=abc&imwidth=300');
+// Tile 2: sub-euro piece price, distinct per-unit price, 'κιλ' folded to 'κιλό'.
+assert.equal(abRender1.sku, '7579721');
+assert.equal(abRender1.brand, 'ΑΒ');
+assert.equal(abRender1.pricePiece, 0.83);
+assert.equal(abRender1.priceUnit, 2.08);
+assert.equal(abRender1.unitLabel, 'κιλό');
 
 // --- ab scrape: brand-only retry when the full title stops surfacing ------
 // the SKU (index churn). The exact-SKU pick keeps the retry mismatch-proof.
