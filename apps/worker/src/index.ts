@@ -11,6 +11,7 @@ import type {
   UpdateProductPayload,
 } from '@grocery/core/types';
 import { adapterRegistry } from '@grocery/scrapers/registry';
+import { queryTokens } from '@grocery/scrapers/kritikos';
 import type { RetailerAdapter, SearchHints } from '@grocery/scrapers/types';
 import { runScrape, type Env } from './scrape';
 import { makeResidentialFetch } from './residential-fetch';
@@ -208,6 +209,17 @@ app.get('/api/retailer-search', async (c) => {
   const eanKey = eanHint ?? '';
 
   const searchOne = async (adapter: RetailerAdapter): Promise<RetailerSearchResult[]> => {
+    // Kritikos has no server-side search: its live adapter downloads the whole
+    // ~29 MB catalog and scans it in-invocation, which blows the Workers
+    // free-plan CPU budget on the edge (a 1102/5xx) and re-fetches 29 MB through
+    // the paid proxy on every retry pass. So the edge doesn't run it — it reads
+    // the D1 discovery index the off-edge daily scrape builds instead (a cheap
+    // LIKE over ~8.5k rows). No proxy fetch, so no residential-fetch cache to
+    // consult; the query itself is the cheap part.
+    if ('kritikos' === adapter.id) {
+      return searchKritikosCatalog(c.env, query, eanHint);
+    }
+
     const cached = await readSearchCache(c.env, adapter.id, query, eanKey);
 
     if (null !== cached) {
@@ -692,6 +704,99 @@ const writeSearchCache = async (
       .run();
   } catch {
     // A cache write must never fail the search — swallow and move on.
+  }
+};
+
+interface KritikosCatalogRow {
+  sku: string;
+  name: string;
+  url: string;
+  ean: string | null;
+  price_piece: number | null;
+  price_unit: number | null;
+  unit_label: string | null;
+  image_url: string | null;
+}
+
+const KRITIKOS_MAX_RESULTS = 100;
+const KRITIKOS_COLUMNS = 'sku, name, url, ean, price_piece, price_unit, unit_label, image_url';
+
+/** Escape LIKE metacharacters so a query token matches literally (ESCAPE '\'). */
+const escapeLike = (value: string): string => value.replace(/[\\%_]/g, (ch) => `\\${ch}`);
+
+const kritikosRowToResult = (
+  row: KritikosCatalogRow,
+  matchedEan: string | null,
+): RetailerSearchResult => ({
+  retailer: 'kritikos',
+  sku: row.sku,
+  title: row.name,
+  url: row.url,
+  brand: null,
+  ean: matchedEan ?? row.ean,
+  pricePiece: row.price_piece,
+  priceUnit: row.price_unit,
+  unitLabel: row.unit_label,
+  imageUrl: row.image_url,
+});
+
+/**
+ * Answer a Kritikos search from the D1 discovery index (built off-edge — see
+ * schema.sql and scrape-local.ts) instead of downloading the live 29 MB catalog
+ * on the edge. An EAN hint matches exactly against the pipe-delimited barcodes
+ * and ranks first (a barcode is identity — Kritikos's abbreviated titles often
+ * defeat token matching); each text token becomes a `haystack LIKE ?` AND-term,
+ * mirroring the live adapter's every-token substring rule. Best-effort: if the
+ * table is missing (not migrated yet) or the query errors, return no results
+ * rather than failing — this path must never 5xx (that was the whole problem).
+ */
+const searchKritikosCatalog = async (
+  env: Env,
+  query: string,
+  ean: string | undefined,
+): Promise<RetailerSearchResult[]> => {
+  const tokens = queryTokens(query);
+  const hasEan = undefined !== ean && 0 < ean.length;
+
+  if (0 === tokens.length && false === hasEan) {
+    return [];
+  }
+
+  try {
+    const exact: RetailerSearchResult[] = [];
+
+    if (hasEan && undefined !== ean) {
+      const { results } = await env.DB.prepare(
+        `SELECT ${KRITIKOS_COLUMNS} FROM kritikos_catalog
+         WHERE barcodes LIKE ('%|' || ? || '|%') LIMIT ?`,
+      )
+        .bind(ean, KRITIKOS_MAX_RESULTS)
+        .all<KritikosCatalogRow>();
+
+      exact.push(...results.map((row) => kritikosRowToResult(row, ean)));
+    }
+
+    const text: RetailerSearchResult[] = [];
+
+    if (0 < tokens.length) {
+      const clause = tokens
+        .map(() => `haystack LIKE ('%' || ? || '%') ESCAPE '\\'`)
+        .join(' AND ');
+      const { results } = await env.DB.prepare(
+        `SELECT ${KRITIKOS_COLUMNS} FROM kritikos_catalog WHERE ${clause} LIMIT ?`,
+      )
+        .bind(...tokens.map(escapeLike), KRITIKOS_MAX_RESULTS)
+        .all<KritikosCatalogRow>();
+
+      text.push(...results.map((row) => kritikosRowToResult(row, null)));
+    }
+
+    // Exact-EAN matches lead; drop any text row that duplicates one.
+    const seen = new Set(exact.map((result) => result.sku));
+
+    return [...exact, ...text.filter((result) => false === seen.has(result.sku))];
+  } catch {
+    return [];
   }
 };
 

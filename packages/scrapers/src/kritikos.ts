@@ -72,11 +72,7 @@ export const kritikosAdapter: RetailerAdapter = {
   },
 
   async searchProducts(query, fetchImpl, hints) {
-    // Punctuation-only tokens ("&" in "Φιστικοβούτυρο & Σοκολάτα") can
-    // never appear in searchTerms and would zero out every match.
-    const tokens = transliterate(query)
-      .split(/\s+/)
-      .filter((token) => /[a-z0-9]/.test(token));
+    const tokens = queryTokens(query);
     const ean = undefined !== hints?.ean && 0 < hints.ean.length ? hints.ean : null;
 
     if (0 === tokens.length && null === ean) {
@@ -230,10 +226,16 @@ const toUnitLabel = (raw: unknown): string | null => {
   return UNIT_LABELS.get(raw) ?? raw.toLowerCase();
 };
 
-const matchesSearchTerms = (product: JsonObject, tokens: readonly string[]): boolean => {
+/**
+ * The lowercased greeklish string a query's tokens are matched against —
+ * the site's own pre-transliterated searchTerms fields, concatenated. Shared
+ * by the live catalog scan (matchesSearchTerms) and the D1 discovery index
+ * (parseCatalogEntry) so both match on exactly the same haystack.
+ */
+export const buildHaystack = (product: JsonObject): string => {
   const searchTerms = isObject(product['searchTerms']) ? product['searchTerms'] : {};
 
-  const haystack = [
+  return [
     searchTerms['name'],
     searchTerms['brand'],
     searchTerms['type'],
@@ -245,8 +247,25 @@ const matchesSearchTerms = (product: JsonObject, tokens: readonly string[]): boo
     .filter((value): value is string => 'string' === typeof value)
     .join(' ')
     .toLowerCase();
+};
+
+const matchesSearchTerms = (product: JsonObject, tokens: readonly string[]): boolean => {
+  const haystack = buildHaystack(product);
 
   return tokens.every((token) => haystack.includes(token));
+};
+
+/**
+ * Transliterate a user query into the greeklish tokens matched against a
+ * product haystack. Punctuation-only tokens ("&" in "Φιστικοβούτυρο & Σοκολάτα")
+ * can never appear in searchTerms and would zero out every match, so drop any
+ * token with no alphanumeric. Shared by searchProducts and the edge index query
+ * so both tokenize identically.
+ */
+export const queryTokens = (query: string): string[] => {
+  return transliterate(query)
+    .split(/\s+/)
+    .filter((token) => /[a-z0-9]/.test(token));
 };
 
 const mapSearchResult = (
@@ -278,6 +297,120 @@ const mapSearchResult = (
     unitLabel: prices.unitLabel,
     imageUrl: extractImageUrl(product['images']),
   };
+};
+
+/**
+ * One product's flattened, searchable form for the D1 discovery index. Kritikos
+ * ships no server-side search, so its adapter otherwise downloads the whole
+ * ~29 MB catalog and scans it per query — which blows the Workers free-plan CPU
+ * budget on the edge. Instead the off-edge daily scrape (residential IP, no CPU
+ * limit) turns the catalog into these rows once a day; the edge then answers a
+ * search with a cheap `haystack LIKE ?` over ~8.5k rows. `barcodes` keeps every
+ * EAN so the edge can do an exact-EAN lookup; `url` is prebuilt so a row maps
+ * straight to a RetailerSearchResult.
+ */
+export interface KritikosCatalogEntry {
+  sku: string;
+  name: string;
+  url: string;
+  /** Lowercased greeklish searchTerms — the LIKE target (see buildHaystack). */
+  haystack: string;
+  /** Every barcode on the product; the edge matches an EAN hint against these. */
+  barcodes: string[];
+  /** First barcode — the identity stamped on a result that has one. */
+  ean: string | null;
+  pricePiece: number | null;
+  priceUnit: number | null;
+  unitLabel: string | null;
+  imageUrl: string | null;
+}
+
+/**
+ * Flatten one raw catalog product into an index entry, reusing the exact price,
+ * name, image and haystack logic the live search uses so indexed results match
+ * scanned ones field-for-field. Returns null for entries missing the identity
+ * fields (sku/slug/name), which can't be linked or displayed anyway.
+ */
+export const parseCatalogEntry = (product: JsonObject): KritikosCatalogEntry | null => {
+  const sku = product['sku'];
+  const slug = product['slug'];
+  const name = cleanName(product['name']);
+
+  if ('string' !== typeof sku || 'string' !== typeof slug || null === name) {
+    return null;
+  }
+
+  const prices = mapPrices(product);
+  const rawBarcodes = product['barcodes'];
+  const barcodes = Array.isArray(rawBarcodes)
+    ? rawBarcodes.filter((code): code is string => 'string' === typeof code && 0 < code.length)
+    : [];
+
+  return {
+    sku,
+    name,
+    url: `${BASE_URL}/${slug}/`,
+    haystack: buildHaystack(product),
+    barcodes,
+    ean: barcodes[0] ?? null,
+    pricePiece: prices.pricePiece,
+    priceUnit: prices.priceUnit,
+    unitLabel: prices.unitLabel,
+    imageUrl: extractImageUrl(product['images']),
+  };
+};
+
+/**
+ * Fetch the full catalog and flatten it into index entries — the off-edge
+ * counterpart to searchProducts. Runs from a residential IP (the daily scrape),
+ * where the 29 MB download and the whole-catalog scan carry no CPU/egress
+ * penalty. Streams the body so peak memory stays bounded to one product, and
+ * never early-exits: every product must be indexed.
+ */
+export const buildCatalogIndex = async (
+  fetchImpl: typeof fetch,
+): Promise<KritikosCatalogEntry[]> => {
+  const response = await fetchImpl(CATALOG_URL, {
+    headers: {
+      'User-Agent': USER_AGENT,
+      Accept: 'application/json',
+      appId: 'kritikos-web',
+    },
+  });
+
+  if (false === response.ok) {
+    throw new AdapterError('kritikos', CATALOG_URL, `HTTP ${response.status}`);
+  }
+
+  const entries: KritikosCatalogEntry[] = [];
+
+  const onProduct = (raw: string): boolean => {
+    let product: unknown;
+
+    try {
+      product = JSON.parse(raw);
+    } catch {
+      return true;
+    }
+
+    if (isObject(product)) {
+      const entry = parseCatalogEntry(product);
+
+      if (null !== entry) {
+        entries.push(entry);
+      }
+    }
+
+    return true;
+  };
+
+  if (null !== response.body) {
+    await scanStream(response.body, onProduct);
+  } else {
+    scanText(await response.text(), createProductScanner(onProduct));
+  }
+
+  return entries;
 };
 
 /**

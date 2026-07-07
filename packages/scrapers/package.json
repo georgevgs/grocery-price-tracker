@@ -7,6 +7,7 @@
     "./types": "./src/types.ts",
     "./sklavenitis": "./src/sklavenitis.ts",
     "./ab": "./src/ab.ts",
+    "./kritikos": "./src/kritikos.ts",
     "./registry": "./src/registry.ts"
   },
   "scripts": {

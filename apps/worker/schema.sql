@@ -72,3 +72,36 @@ CREATE TABLE IF NOT EXISTS search_cache (
     cached_at TEXT NOT NULL DEFAULT (datetime('now')),
     PRIMARY KEY (retailer, query, ean)
 );
+
+-- Kritikos discovery index. Kritikos ships NO server-side search: the site
+-- downloads its entire ~29 MB catalog and filters in the browser. Replicating
+-- that on the edge means fetching 29 MB through the paid residential proxy and
+-- scanning it in-invocation, which blows the Workers free-plan CPU budget (a
+-- 1102/5xx) — so the edge can't do it. Instead the off-edge daily scrape
+-- (residential IP, no CPU limit — scripts/scrape-local.ts) flattens the catalog
+-- into these rows once a day, and the edge answers a search with a cheap
+-- `haystack LIKE ?` over ~8.5k rows (no proxy fetch, trivial CPU).
+--
+-- `haystack` is the product's lowercased greeklish searchTerms (the LIKE
+-- target); `barcodes` is pipe-delimited (|a|b|) so an EAN hint matches exactly
+-- via LIKE '%|<ean>|%' without crossing barcode boundaries; `url` is prebuilt so
+-- a row maps straight to a search result. `indexed_at` is set to the run's
+-- timestamp on every upsert, so rows a later run doesn't re-touch (products
+-- pulled from the catalog) are pruned by a trailing DELETE.
+--
+-- Pure cache: safe to drop and let the next scrape repopulate. If the table is
+-- missing entirely (not migrated yet), Kritikos search degrades to no results —
+-- the edge query swallows the error rather than 5xx-ing.
+CREATE TABLE IF NOT EXISTS kritikos_catalog (
+    sku         TEXT PRIMARY KEY,
+    name        TEXT NOT NULL,
+    url         TEXT NOT NULL,
+    haystack    TEXT NOT NULL,
+    barcodes    TEXT NOT NULL DEFAULT '',
+    ean         TEXT,
+    price_piece REAL,
+    price_unit  REAL,
+    unit_label  TEXT,
+    image_url   TEXT,
+    indexed_at  TEXT NOT NULL DEFAULT (datetime('now'))
+);

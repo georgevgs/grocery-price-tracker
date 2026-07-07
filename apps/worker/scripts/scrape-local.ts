@@ -25,6 +25,7 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { RetailerId } from '@grocery/core/types';
 import { adapterRegistry } from '@grocery/scrapers/registry';
+import { buildCatalogIndex, type KritikosCatalogEntry } from '@grocery/scrapers/kritikos';
 import { scrapeFailureOutcome, unitPriceSanityWarning } from '../src/scrape';
 
 const WORKER_DIR = join(dirname(fileURLToPath(import.meta.url)), '..');
@@ -221,6 +222,101 @@ const writeResults = (sql: string): void => {
   wrangler(['d1', 'execute', DATABASE, '--remote', '--file', file]);
 };
 
+// --- Kritikos catalog index -------------------------------------------------
+//
+// Kritikos ships no server-side search, so the edge can't scan its ~29 MB
+// catalog within the Workers CPU budget (see apps/worker/schema.sql). This job
+// runs from a residential IP with no such limit: fetch the catalog once, flatten
+// it (buildCatalogIndex reuses the adapter's parsing), and mirror it into the
+// kritikos_catalog table so the edge can answer a search with a cheap LIKE.
+
+/** ~29 MB of INSERTs won't fit one D1 request; upload in modest batches. */
+const CATALOG_INDEX_CHUNK = 200;
+
+const catalogInsert = (entry: KritikosCatalogEntry, indexedAt: string): string => {
+  // Pipe-delimit barcodes (|a|b|) so the edge can match an EAN hint exactly
+  // via LIKE '%|<ean>|%' without one barcode's digits bleeding into another's.
+  const barcodes = 0 < entry.barcodes.length ? `|${entry.barcodes.join('|')}|` : '';
+
+  return (
+    'INSERT OR REPLACE INTO kritikos_catalog ' +
+    '(sku, name, url, haystack, barcodes, ean, price_piece, price_unit, unit_label, image_url, indexed_at) ' +
+    `VALUES (${sqlStr(entry.sku)}, ${sqlStr(entry.name)}, ${sqlStr(entry.url)}, ${sqlStr(entry.haystack)}, ` +
+    `${sqlStr(barcodes)}, ${sqlStr(entry.ean)}, ${sqlNum(entry.pricePiece)}, ${sqlNum(entry.priceUnit)}, ` +
+    `${sqlStr(entry.unitLabel)}, ${sqlStr(entry.imageUrl)}, ${sqlStr(indexedAt)});`
+  );
+};
+
+const writeCatalogIndex = (entries: readonly KritikosCatalogEntry[], indexedAt: string): void => {
+  const statements = entries.map((entry) => catalogInsert(entry, indexedAt));
+
+  for (let start = 0; start < statements.length; start += CATALOG_INDEX_CHUNK) {
+    const chunk = statements.slice(start, start + CATALOG_INDEX_CHUNK);
+    writeResults(chunk.join('\n'));
+    console.log(`[scrape-local]   indexed ${Math.min(start + chunk.length, statements.length)}/${statements.length}`);
+  }
+
+  // Prune products that dropped out of the catalog: this run stamped every
+  // current row with indexedAt, so anything older wasn't re-touched. Runs only
+  // after every insert chunk succeeded (execFileSync throws otherwise), so a
+  // mid-run failure can never delete live rows.
+  writeResults(`DELETE FROM kritikos_catalog WHERE indexed_at < ${sqlStr(indexedAt)};`);
+};
+
+const runCatalogIndex = async (indexedAt: string): Promise<void> => {
+  // Fully self-contained: any failure here (catalog fetch, a chunk upload) is
+  // logged and swallowed so it can never sink the price scrape that already ran
+  // or mark the job fatal — the edge just keeps serving the previous index.
+  try {
+    console.log('[scrape-local] building Kritikos catalog index...');
+    const entries = await buildCatalogIndex(fetch);
+    console.log(`[scrape-local] Kritikos catalog: ${entries.length} product(s)`);
+
+    if (DRY_RUN) {
+      const sample = entries.slice(0, 3).map((entry) => `  - ${entry.sku} ${entry.name}`).join('\n');
+      console.log(`[scrape-local] dry run — would index ${entries.length} Kritikos product(s):\n${sample}`);
+      return;
+    }
+
+    if (0 === entries.length) {
+      // Never prune against an empty parse — that would wipe the whole index.
+      console.log('[scrape-local] Kritikos catalog came back empty — leaving the existing index in place.');
+      return;
+    }
+
+    writeCatalogIndex(entries, indexedAt);
+    console.log('[scrape-local] Kritikos catalog index updated.');
+  } catch (error) {
+    console.error(
+      `[scrape-local] Kritikos catalog index failed (prices unaffected): ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+};
+
+/** Write today's prices and image backfills — no-op when there's nothing to write. */
+const writePrices = (
+  prices: readonly PriceWrite[],
+  images: readonly ImageBackfill[],
+  scrapedDate: string,
+  scrapedAt: string,
+): void => {
+  if (0 === prices.length && 0 === images.length) {
+    console.log('[scrape-local] nothing to write.');
+    return;
+  }
+
+  const sql = buildSql(prices, images, scrapedDate, scrapedAt);
+
+  if (DRY_RUN) {
+    console.log(`[scrape-local] dry run — would run ${prices.length + images.length} statement(s):\n${sql}`);
+    return;
+  }
+
+  console.log(`[scrape-local] writing ${prices.length + images.length} statement(s) to remote D1...`);
+  writeResults(sql);
+  console.log('[scrape-local] done.');
+};
+
 const main = async (): Promise<void> => {
   console.log(`[scrape-local] loading targets from remote D1${DRY_RUN ? ' (dry run)' : ''}...`);
   const targets = loadTargets();
@@ -246,21 +342,11 @@ const main = async (): Promise<void> => {
     console.error(`  x ${error}`);
   }
 
-  if (0 === prices.length && 0 === images.length) {
-    console.log('[scrape-local] nothing to write.');
-    return;
-  }
+  writePrices(prices, images, scrapedDate, scrapedAt);
 
-  const sql = buildSql(prices, images, scrapedDate, scrapedAt);
-
-  if (DRY_RUN) {
-    console.log(`[scrape-local] dry run — would run ${prices.length + images.length} statement(s):\n${sql}`);
-    return;
-  }
-
-  console.log(`[scrape-local] writing ${prices.length + images.length} statement(s) to remote D1...`);
-  writeResults(sql);
-  console.log('[scrape-local] done.');
+  // The catalog index is discovery data, independent of the tracked listings
+  // above, so it rebuilds every run regardless of whether any price was written.
+  await runCatalogIndex(scrapedAt);
 };
 
 main().catch((error: unknown) => {

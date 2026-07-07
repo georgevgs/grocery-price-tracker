@@ -25,8 +25,12 @@ import {
   masoutisAdapter,
 } from '../packages/scrapers/src/masoutis';
 import {
+  buildCatalogIndex,
+  buildHaystack,
   createProductScanner,
   kritikosAdapter,
+  parseCatalogEntry,
+  queryTokens,
   transliterate,
 } from '../packages/scrapers/src/kritikos';
 import { mapProductsResponse as mapGalaxiasProductsResponse } from '../packages/scrapers/src/galaxias';
@@ -686,6 +690,48 @@ const kritikosWeighed = await kritikosAdapter.searchProducts('τομάτες', k
 assert.equal(kritikosWeighed.length, 1);
 assert.equal(kritikosWeighed[0]?.pricePiece, null);
 assert.equal(kritikosWeighed[0]?.priceUnit, 1.98);
+
+// --- kritikos catalog index (the off-edge D1 discovery path) ---------------
+
+// queryTokens is shared by the live scan and the edge index query, so both
+// tokenize identically: transliterate, split, drop punctuation-only tokens.
+assert.deepEqual(queryTokens('ψωμί & τοστ'), ['pswmi', 'tost']);
+assert.deepEqual(queryTokens('   '), []);
+
+// buildHaystack is the shared LIKE target — the lowercased greeklish the live
+// scan matches against, so an indexed row matches the same queries a scan would.
+const kritikosBread = JSON.parse(KRITIKOS_CATALOG).payload.products[0];
+const breadHaystack = buildHaystack(kritikosBread);
+assert.ok(breadHaystack.includes('pswmi'));
+assert.ok(breadHaystack.includes('tost'));
+assert.ok(breadHaystack.includes('karamolegkos'));
+
+// buildCatalogIndex flattens the WHOLE catalog into index rows (never early-exits).
+const kritikosIndex = await buildCatalogIndex(kritikosFakeFetch);
+assert.equal(kritikosIndex.length, 2);
+
+const breadEntry = kritikosIndex.find((entry) => '30083' === entry.sku);
+assert.ok(undefined !== breadEntry);
+// Fields map 1:1 onto a scanned search result so discovery is source-agnostic.
+assert.equal(breadEntry.name, 'ΚΑΡΑΜΟΛΕΓΚΟΣ ΨΩΜΙ ΤΟΣΤ ΦΟΡΜΑ 680ΓΡ');
+assert.ok(breadEntry.url.endsWith('karamolegkos-psomi-tost-forma-680gr-30083/'));
+assert.deepEqual(breadEntry.barcodes, ['5205711123456']);
+assert.equal(breadEntry.ean, '5205711123456');
+assert.equal(breadEntry.pricePiece, 1.48);
+assert.equal(breadEntry.priceUnit, 2.17);
+assert.equal(breadEntry.unitLabel, 'κιλό');
+assert.ok(breadEntry.haystack.includes('pswmi'));
+
+// Weighed item: per-kg price only, and no barcode → empty barcodes / null ean.
+const tomatoEntry = kritikosIndex.find((entry) => '1505' === entry.sku);
+assert.ok(undefined !== tomatoEntry);
+assert.equal(tomatoEntry.pricePiece, null);
+assert.equal(tomatoEntry.priceUnit, 1.98);
+assert.deepEqual(tomatoEntry.barcodes, []);
+assert.equal(tomatoEntry.ean, null);
+
+// An entry missing an identity field (sku/slug/name) is dropped, not indexed.
+assert.equal(parseCatalogEntry({ name: 'no sku or slug' }), null);
 
 // scrapeProduct reads __NEXT_DATA__ from the product page.
 const KRITIKOS_PRODUCT_HTML = `
