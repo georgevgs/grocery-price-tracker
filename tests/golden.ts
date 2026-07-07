@@ -78,6 +78,20 @@ export const GOLDEN_CASES: readonly GoldenCase[] = [
     shouldMatch: true,
     note: 'punctuation folding in brand tokens',
   },
+  {
+    name: 'cross-script brand FAGE(latin) vs ΦΑΓΕ(greek)',
+    product: { title: 'Γιαούρτι Στραγγιστό 2% 200g', brand: 'ΦΑΓΕ' },
+    result: { title: 'FAGE Total Γιαούρτι Στραγγιστό 2% 200g', brand: 'FAGE' },
+    shouldMatch: true,
+    note: 'phonetic brand fold bridges Φ/Γ, which lack a Latin homoglyph (hard gate)',
+  },
+  {
+    name: 'promo % must not poison the fat-% gate',
+    product: { title: 'Γάλα Φρέσκο 3,5% 1lt', brand: 'ΝΟΥΝΟΥ' },
+    result: { title: 'ΝΟΥΝΟΥ Γάλα Φρέσκο -20% 3,5% 1lt', brand: null },
+    shouldMatch: true,
+    note: 'extractPercent must read the fat 3,5%, not the leading promo -20%',
+  },
 
   // --- adversarial negatives ---------------------------------------------
   {

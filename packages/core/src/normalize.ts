@@ -16,8 +16,20 @@ const SIZE_PATTERN = /(\d+(?:[.,]\d+)?)\s?(kg|gr|g|lt|ml|l|τεμ|γρ)(?![\p{L}
 const MULTIPACK_PATTERN =
   /(\d+)\s?[x×χ*]\s?(\d+(?:[.,]\d+)?)\s?(kg|gr|g|lt|ml|l|τεμ|γρ)(?![\p{L}\p{N}])/u;
 
-// "3,5%" — fat content and friends. An attribute, not a size.
-const PERCENT_PATTERN = /(\d+(?:[.,]\d+)?)\s?%/;
+// "3,5%" — fat content and friends. An attribute, not a size. Global so
+// extractPercent can walk every % on the title and skip promo/discount ones.
+const PERCENT_GLOBAL = /(\d+(?:[.,]\d+)?)\s?%/g;
+
+// A discount word hugging a percentage ("Έκπτωση 20%", "20% προσφορά")
+// marks it as a promo, not the product's fat/attribute figure. Matched
+// against a diacritic-folded window, so the accents don't matter.
+const DISCOUNT_WORD = /(εκπτωσ|προσφορ)/;
+
+const foldDiacritics = (text: string): string =>
+  text
+    .normalize('NFD')
+    .replace(/\p{Diacritic}/gu, '')
+    .toLowerCase();
 
 /**
  * Greek letters folded to their Latin uppercase-homoglyph's lowercase.
@@ -154,7 +166,10 @@ const toSize = (
   }
 
   return {
-    value: numericValue * factorEntry.factor,
+    // Round to the nearest g/ml: floating-point scaling (e.g. 2,01L →
+    // 2010.0000000000002) would otherwise fail the size gate's exact
+    // equality against the same content written in another unit.
+    value: Math.round(numericValue * factorEntry.factor),
     unit: factorEntry.unit,
   };
 };
@@ -163,17 +178,40 @@ const toSize = (
  * "3,5%" → 3.5. Fat content and similar percentages are attributes that
  * distinguish otherwise identical titles (3,5% vs 1,5% milk) — never
  * part of the size and worthless as loose numeric tokens.
+ *
+ * Retailer titles also carry PROMO percentages ("-20%", "Έκπτωση 25%"). A
+ * naive "first %" read would take the discount for the fat figure and make
+ * the percent gate exclude the right product, so promo-marked percentages
+ * (a leading minus, or a discount word hugging the figure) are skipped and
+ * the first genuine attribute % is returned.
  */
 export const extractPercent = (title: string): number | null => {
-  const match = title.match(PERCENT_PATTERN);
+  for (const match of title.matchAll(PERCENT_GLOBAL)) {
+    const index = match.index ?? 0;
+    const before = title.slice(0, index).replace(/\s+$/, '');
 
-  if (null === match || undefined === match[1]) {
-    return null;
+    // "-20%": a minus sign immediately before the number is a discount.
+    if (/[-−‑]$/.test(before)) {
+      continue;
+    }
+
+    // "Έκπτωση 20%" / "20% προσφορά": a discount word within reach either side.
+    const window = foldDiacritics(
+      title.slice(Math.max(0, index - 12), index + (match[0]?.length ?? 0) + 12),
+    );
+
+    if (true === DISCOUNT_WORD.test(window)) {
+      continue;
+    }
+
+    const value = Number((match[1] ?? '').replace(',', '.'));
+
+    if (false === Number.isNaN(value)) {
+      return value;
+    }
   }
 
-  const value = Number(match[1].replace(',', '.'));
-
-  return Number.isNaN(value) ? null : value;
+  return null;
 };
 
 /**
@@ -211,17 +249,56 @@ export const stemFold = (normalizedToken: string): string => {
 };
 
 /**
+ * The Greek letters with no Latin homoglyph (so the homoglyph fold leaves
+ * them Greek), mapped to a phonetic Latin equivalent. Cross-script brand
+ * matching needs this: a product's brand may be stored "ΦΑΓΕ"/"ΝΕΣΚΑΦΕ"
+ * while a retailer writes "FAGE"/"Nescafe" — letters like φ, γ, δ, σ have
+ * no homoglyph, so without a phonetic bridge the brand gate wrongly
+ * excludes the right product. Applied ONLY to brand tokens (via brandFold),
+ * symmetrically on both sides, so it never perturbs the general title
+ * Jaccard, where a single retailer writes one script anyway.
+ */
+const BRAND_PHONETIC = new Map<string, string>([
+  ['γ', 'g'],
+  ['δ', 'd'],
+  ['θ', 'th'],
+  ['λ', 'l'],
+  ['ξ', 'x'],
+  ['π', 'p'],
+  ['σ', 's'],
+  ['φ', 'f'],
+  ['ψ', 'ps'],
+  ['ω', 'o'],
+]);
+
+const phoneticLatin = (normalizedToken: string): string => {
+  let latin = '';
+
+  for (const char of normalizedToken) {
+    latin += BRAND_PHONETIC.get(char) ?? char;
+  }
+
+  return latin;
+};
+
+/** stemFold plus a Greek→Latin phonetic pass, for cross-script brand tokens. */
+export const brandFold = (normalizedToken: string): string => {
+  return phoneticLatin(stemFold(normalizedToken));
+};
+
+/**
  * Every brand token must appear as a whole title token (compared through
- * the spelling fold). Substring matching is wrong in both directions:
- * brand "ΒΙΟ" is not present in "Βιολογικό", and token boundaries are
- * what keeps it that way.
+ * the brand fold, which additionally bridges Greek↔Latin spellings of the
+ * same brand). Substring matching is wrong in both directions: brand "ΒΙΟ"
+ * is not present in "Βιολογικό", and token boundaries are what keeps it
+ * that way.
  */
 export const titleContainsBrand = (title: string, brand: string): boolean => {
-  const titleTokens = new Set([...tokenize(normalizeTitle(title))].map(stemFold));
+  const titleTokens = new Set([...tokenize(normalizeTitle(title))].map(brandFold));
   const brandTokens = tokenize(normalizeTitle(brand));
 
   for (const token of brandTokens) {
-    if (false === titleTokens.has(stemFold(token))) {
+    if (false === titleTokens.has(brandFold(token))) {
       return false;
     }
   }
