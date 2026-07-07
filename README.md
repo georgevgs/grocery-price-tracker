@@ -70,7 +70,8 @@ Type brand + title in the PWA and hit **Find at retailers** — all adapters
 search live, results are ranked by `@grocery/core/match` (brand + size hard
 gates), the top match per retailer is preselected, and saving links the
 listings and scrapes today's prices immediately.
-(Kritikos search streams their full catalog — expect it to be the slow one.)
+(Kritikos search reads a D1 index the off-edge daily scrape rebuilds — see
+the Kritikos row under **Retailer adapters** for why.)
 
 **Editing & removing**: a product's own page has a collapsible edit panel to
 rename it (title/brand/size), unlink a store that was matched wrong, or delete
@@ -140,7 +141,7 @@ Each adapter implements `searchProducts(query)` (discovery) and
 | AB | GraphQL gateway (`/api/v1/`, persisted query `GetProductSearch`) answers plain GETs; tiles carry SKU, name, URL, brand and current prices, so search powers both discovery and the daily scrape | Verified live 2026-07-05 |
 | Masoutis | Angular shell over an ASP.NET JSON API: `GET /api/eshop/GetCred` hands out anonymous `Uid/Usl/Key` headers, then POSTs to `GetOfferItemCustWithCoupons` (by item code from the page URL's `?<digits>=`) and `SearchAllItemsWithCouponsV2` | Verified live 2026-07-05 |
 | My Market | Laravel, fully server-rendered: JSON-LD `@graph` Product on product pages, `measure-label-wrapper` for €/unit, search tiles carry sku/name/price in an analytics attribute. LiteSpeed cache serves up to 6h stale → scrape busts it with a query param | Verified live 2026-07-05 |
-| Kritikos | Next.js SSG: product pages embed full product JSON (`__NEXT_DATA__`, prices in euro-cents). **No server-side search** — the adapter streams their ~29 MB catalog API and brace-scans it product-by-product against greeklish-transliterated `searchTerms` | Verified live 2026-07-05 |
+| Kritikos | Next.js SSG: product pages embed full product JSON (`__NEXT_DATA__`, prices in euro-cents). **No server-side search** — so the ~29 MB catalog API is streamed and brace-scanned against greeklish-transliterated `searchTerms` **off-edge** (that scan blows the Workers free-plan CPU budget), and the off-edge daily scrape flattens it into the `kritikos_catalog` D1 table that the edge searches with a cheap `LIKE` | Verified live 2026-07-05 |
 | Galaxias | Angular shell over Magento 2 GraphQL (`magento2.galaxias.shop/graphql`), unauthenticated: `products(filter:{sku:{eq}})` for the scrape, `products(search:)` for discovery; SKU = EAN-13 | Verified live 2026-07-05 |
 | Lidl | Nuxt SSR + public search API (`/q/api/search`). **Promo-only**: lidl-hellas.gr lists weekly in-store offers, not a shelf catalog — listings track advertised promos and product pages churn with the promo calendar | Verified live 2026-07-05 |
 
