@@ -208,10 +208,35 @@ export interface OrchestratedSearch {
   discoveredEan: string | null;
 }
 
+/**
+ * The progressively looser query shapes searchAndRank walks through (see
+ * its doc comment). Emitted as progress so the UI can narrate the current
+ * pass — language-neutral on purpose: the view layer owns the Greek copy,
+ * no user-facing string leaks into the matcher.
+ */
+export type SearchPass = 'full' | 'brand-stripped' | 'stripped' | 'brand' | 'ean';
+
+/**
+ * Live telemetry for a "what am I doing right now" search board. A `pass`
+ * marks a new query shape starting against a set of chains; a `chain` fires
+ * as each chain's request resolves (with its raw result count — ranking is
+ * downstream); an `ean` surfaces a barcode discovered mid-search.
+ */
+export type SearchProgress =
+  | { kind: 'pass'; pass: SearchPass; retailers: readonly RetailerId[] }
+  | { kind: 'chain'; retailer: RetailerId; count: number }
+  | { kind: 'ean'; ean: string };
+
+export type SearchProgressListener = (event: SearchProgress) => void;
+
 type SearchFn = (
   query: string,
   retailers?: readonly RetailerId[],
   ean?: string | null,
+  // Fires per chain as its request settles, so the caller can paint live
+  // per-chain progress during a fan-out. Optional: test stubs and the
+  // scan-to-prefill path (resolveIdentityByEan) simply omit it.
+  onChain?: (retailer: RetailerId, count: number) => void,
 ) => Promise<RetailerSearchResponse>;
 
 /**
@@ -241,10 +266,14 @@ export const searchAndRank = async (
   ean: string | null,
   retailers?: readonly RetailerId[],
   searchFn: SearchFn = searchRetailers,
+  onProgress?: SearchProgressListener,
 ): Promise<OrchestratedSearch> => {
   const query = `${brand} ${title}`.trim();
   const ranked = new Map<RetailerId, RankedResult[]>();
   const errors: string[] = [];
+  // The canonical chain list, used when a pass targets "everyone" (subset
+  // undefined) so the progress board knows which rows to light up.
+  const allRetailers: readonly RetailerId[] = [...RETAILER_LABELS.keys()];
 
   const topScore = (retailer: RetailerId): number => {
     return ranked.get(retailer)?.[0]?.score ?? -1;
@@ -254,8 +283,13 @@ export const searchAndRank = async (
     passQuery: string,
     subset: readonly RetailerId[] | undefined,
     passEan: string | null,
+    pass: SearchPass,
   ): Promise<void> => {
-    const response = await searchFn(passQuery, subset, passEan);
+    onProgress?.({ kind: 'pass', pass, retailers: subset ?? allRetailers });
+
+    const response = await searchFn(passQuery, subset, passEan, (retailer, count) =>
+      onProgress?.({ kind: 'chain', retailer, count }),
+    );
     errors.push(...response.errors);
 
     for (const [retailer, results] of Object.entries(response.results)) {
@@ -266,17 +300,17 @@ export const searchAndRank = async (
     }
   };
 
-  await runPass(query, retailers, ean);
+  await runPass(query, retailers, ean, 'full');
 
   const strippedTitle = stripNumericTokens(title);
   const usedQueries = new Set([query]);
-  const retryQueries = [
-    `${brand} ${strippedTitle}`.trim(),
-    strippedTitle,
-    brand.trim(),
+  const retryPasses: { query: string; pass: SearchPass }[] = [
+    { query: `${brand} ${strippedTitle}`.trim(), pass: 'brand-stripped' },
+    { query: strippedTitle, pass: 'stripped' },
+    { query: brand.trim(), pass: 'brand' },
   ];
 
-  for (const retryQuery of retryQueries) {
+  for (const { query: retryQuery, pass } of retryPasses) {
     if (retryQuery.length < 3 || true === usedQueries.has(retryQuery)) {
       continue;
     }
@@ -290,7 +324,7 @@ export const searchAndRank = async (
     }
 
     usedQueries.add(retryQuery);
-    await runPass(retryQuery, weakChains, ean);
+    await runPass(retryQuery, weakChains, ean, pass);
   }
 
   let discoveredEan: string | null = null;
@@ -314,7 +348,8 @@ export const searchAndRank = async (
       );
 
       if (0 < eanChains.length) {
-        await runPass(query, eanChains, discoveredEan);
+        onProgress?.({ kind: 'ean', ean: discoveredEan });
+        await runPass(query, eanChains, discoveredEan, 'ean');
       }
     }
   }

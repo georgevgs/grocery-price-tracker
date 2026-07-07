@@ -5,6 +5,7 @@ import { extractEanFromInput, extractSize } from '@grocery/core/normalize';
 import { createProduct, lookupBarcode, triggerScrape } from '../api/client';
 import { BarcodeScannerModal } from './BarcodeScannerModal';
 import { CandidateGroups } from './RetailerCandidates';
+import { SearchProgressBoard, useSearchProgress } from './SearchProgressBoard';
 import {
   collectConfirmedEan,
   collectProductImage,
@@ -39,6 +40,8 @@ export const AddProductForm = ({ existingProducts, onCreated }: AddProductFormPr
   // Product shot from Open Food Facts (populated on scan) — a fallback for
   // products no retailer candidate carries an image for.
   const [scanImageUrl, setScanImageUrl] = useState<string | null>(null);
+  // Live search telemetry for the progress board shown while isSearching.
+  const { progress, onProgress, reset: resetProgress } = useSearchProgress();
 
   // Derived during render — never synced into state via effects.
   const duplicateSuggestions = computeSuggestions(brand, title, existingProducts);
@@ -47,6 +50,7 @@ export const AddProductForm = ({ existingProducts, onCreated }: AddProductFormPr
     setIsSearching(true);
     setSubmitError(null);
     setSearchErrors([]);
+    resetProgress();
 
     try {
       const scanned = extractEanFromInput(eanOverride ?? ean);
@@ -104,6 +108,9 @@ export const AddProductForm = ({ existingProducts, onCreated }: AddProductFormPr
         effectiveTitle,
         effectiveBrand,
         scanned,
+        undefined,
+        undefined,
+        onProgress,
       );
       const sliced = new Map<RetailerId, RankedResult[]>();
       const preselected = new Map<RetailerId, string | null>();
@@ -261,6 +268,8 @@ export const AddProductForm = ({ existingProducts, onCreated }: AddProductFormPr
       >
         {searchLabel}
       </button>
+
+      {true === isSearching && <SearchProgressBoard progress={progress} />}
 
       {searchErrors.map((error) => (
         <p key={error} className="text-sm text-warn">

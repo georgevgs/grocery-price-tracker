@@ -11,6 +11,7 @@ import {
 import { BarcodeScannerModal } from './BarcodeScannerModal';
 import { ErrorNotice } from './ErrorNotice';
 import { CandidateGroups } from './RetailerCandidates';
+import { SearchProgressBoard, useSearchProgress } from './SearchProgressBoard';
 import {
   collectConfirmedEan,
   collectSelectedListings,
@@ -49,6 +50,8 @@ export const UpdateRetailersPanel = ({ product }: UpdateRetailersPanelProps) => 
   const [isResolvingUrl, setIsResolvingUrl] = useState(false);
   const [errors, setErrors] = useState<string[]>([]);
   const [notice, setNotice] = useState<string | null>(null);
+  // Live search telemetry for the progress board shown while isSearching.
+  const { progress, onProgress, reset: resetProgress } = useSearchProgress();
 
   const tracked = new Set(product.listings.map((listing) => listing.retailer));
   const missing = [...RETAILER_LABELS.keys()].filter((id) => false === tracked.has(id));
@@ -72,6 +75,7 @@ export const UpdateRetailersPanel = ({ product }: UpdateRetailersPanelProps) => 
     setIsSearching(true);
     setErrors([]);
     setNotice(null);
+    resetProgress();
 
     try {
       // The field accepts a bare barcode or a galaxias.shop product link
@@ -99,6 +103,8 @@ export const UpdateRetailersPanel = ({ product }: UpdateRetailersPanelProps) => 
         product.brand,
         searchEan,
         missing,
+        undefined,
+        onProgress,
       );
 
       const sliced = new Map<RetailerId, RankedResult[]>();
@@ -257,6 +263,8 @@ export const UpdateRetailersPanel = ({ product }: UpdateRetailersPanelProps) => 
           {searchLabel}
         </button>
       </div>
+
+      {true === isSearching && <SearchProgressBoard progress={progress} />}
 
       <div className="flex gap-2">
         <input

@@ -138,17 +138,27 @@ export const searchRetailers = async (
   query: string,
   retailers?: readonly RetailerId[],
   ean?: string | null,
+  // Notified the moment each chain's request settles (with its result
+  // count), so a live UI can fill chains in one-by-one as they land rather
+  // than waiting for the whole fan-out. Optional — callers that don't
+  // render progress omit it.
+  onChain?: (retailer: RetailerId, count: number) => void,
 ): Promise<RetailerSearchResponse> => {
   const targets = undefined !== retailers && 0 < retailers.length ? retailers : ALL_RETAILERS;
 
   const responses = await Promise.all(
     targets.map((retailer) =>
-      searchOneRetailer(query, retailer, ean).catch(
-        (error): RetailerSearchResponse => ({
-          results: {},
-          errors: [`[${retailer}] ${error instanceof Error ? error.message : String(error)}`],
+      searchOneRetailer(query, retailer, ean)
+        .catch(
+          (error): RetailerSearchResponse => ({
+            results: {},
+            errors: [`[${retailer}] ${error instanceof Error ? error.message : String(error)}`],
+          }),
+        )
+        .then((response) => {
+          onChain?.(retailer, response.results[retailer]?.length ?? 0);
+          return response;
         }),
-      ),
     ),
   );
 
