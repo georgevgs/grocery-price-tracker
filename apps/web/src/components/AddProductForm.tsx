@@ -4,6 +4,7 @@ import { suggestMatches, type MatchSuggestion } from '@grocery/core/match';
 import { extractEanFromInput, extractSize } from '@grocery/core/normalize';
 import { createProduct, lookupBarcode, triggerScrape } from '../api/client';
 import { BarcodeScannerModal } from './BarcodeScannerModal';
+import { ErrorNotice } from './ErrorNotice';
 import { CandidateGroups } from './RetailerCandidates';
 import { SearchProgressBoard, useSearchProgress } from './SearchProgressBoard';
 import {
@@ -213,11 +214,7 @@ export const AddProductForm = ({ existingProducts, onCreated }: AddProductFormPr
     submitLabel = 'ΑΠΟΘΗΚΕΥΣΗ & ΛΗΨΗ ΤΙΜΩΝ…';
   }
 
-  let errorBlock = null;
-
-  if (null !== submitError) {
-    errorBlock = <p className="text-sm text-danger">{submitError}</p>;
-  }
+  const errorBlock = <ErrorNotice messages={null !== submitError ? [submitError] : []} />;
 
   return (
     <form
@@ -271,11 +268,7 @@ export const AddProductForm = ({ existingProducts, onCreated }: AddProductFormPr
 
       {true === isSearching && <SearchProgressBoard progress={progress} />}
 
-      {searchErrors.map((error) => (
-        <p key={error} className="text-sm text-warn">
-          {error}
-        </p>
-      ))}
+      <ErrorNotice messages={searchErrors} tone="warn" />
 
       {null !== candidates && (
         <CandidateGroups
