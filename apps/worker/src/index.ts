@@ -11,7 +11,9 @@ import type {
   UpdateProductPayload,
 } from '@grocery/core/types';
 import { adapterRegistry } from '@grocery/scrapers/registry';
+import type { RetailerAdapter } from '@grocery/scrapers/types';
 import { runScrape, type Env } from './scrape';
+import { makeResidentialFetch } from './residential-fetch';
 import { lookupBarcode, type BarcodeInfo } from './openfoodfacts';
 
 interface ProductRow {
@@ -176,8 +178,19 @@ app.get('/api/retailer-search', async (c) => {
   const rawEan = c.req.query('ean')?.trim();
   const hints = undefined !== rawEan && /^\d{8,14}$/.test(rawEan) ? { ean: rawEan } : undefined;
 
+  // Chains flagged needsResidentialEgress (AB, Kritikos, Sklavenitis) 403/503
+  // from Cloudflare's edge, so route them through the residential scraping API
+  // when a token is configured; everyone else uses the free global fetch.
+  // Without a token the flagged chains just fail into errors[] as before —
+  // search degrades, never crashes.
+  const proxyToken = c.env.RESIDENTIAL_PROXY_TOKEN;
+  const residentialFetch =
+    undefined !== proxyToken && 0 < proxyToken.length ? makeResidentialFetch(proxyToken) : undefined;
+  const fetchFor = (adapter: RetailerAdapter): typeof fetch =>
+    true === adapter.needsResidentialEgress && undefined !== residentialFetch ? residentialFetch : fetch;
+
   const outcomes = await Promise.allSettled(
-    adapters.map((adapter) => adapter.searchProducts(query, fetch, hints)),
+    adapters.map((adapter) => adapter.searchProducts(query, fetchFor(adapter), hints)),
   );
 
   const results: Partial<Record<RetailerId, RetailerSearchResult[]>> = {};
@@ -318,8 +331,17 @@ app.post('/api/resolve-url', async (c) => {
   parsed.hash = '';
   const url = parsed.toString();
 
+  // Same residential-egress routing as /api/retailer-search: a blocked chain's
+  // product page 403s from the edge, so resolve it through the scraping API
+  // when a token is set; unflagged chains stay on the free global fetch.
+  const proxyToken = c.env.RESIDENTIAL_PROXY_TOKEN;
+  const scrapeFetch =
+    true === adapter.needsResidentialEgress && undefined !== proxyToken && 0 < proxyToken.length
+      ? makeResidentialFetch(proxyToken)
+      : fetch;
+
   try {
-    const scraped = await adapter.scrapeProduct(url, fetch, {
+    const scraped = await adapter.scrapeProduct(url, scrapeFetch, {
       productTitle: payload.productTitle,
     });
 

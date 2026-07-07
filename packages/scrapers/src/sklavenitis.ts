@@ -30,6 +30,8 @@ const USER_AGENT = 'Mozilla/5.0 (X11; Linux x86_64) personal-price-watch/1.0';
  */
 export const sklavenitisAdapter: RetailerAdapter = {
   id: 'sklavenitis',
+  // sklavenitis.gr's WAF blocks Cloudflare egress IPs; residential works.
+  needsResidentialEgress: true,
 
   async scrapeProduct(url, fetchImpl) {
     const response = await fetchImpl(url, {

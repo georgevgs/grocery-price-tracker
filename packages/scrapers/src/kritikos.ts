@@ -26,6 +26,8 @@ const MAX_SEARCH_RESULTS = 100;
  */
 export const kritikosAdapter: RetailerAdapter = {
   id: 'kritikos',
+  // The CDN in front of kritikos-sm.gr returns 503/429 to Cloudflare egress IPs; residential works.
+  needsResidentialEgress: true,
 
   async scrapeProduct(url, fetchImpl) {
     const response = await fetchImpl(url, {

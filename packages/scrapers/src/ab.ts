@@ -33,6 +33,18 @@ const USER_AGENT = 'Mozilla/5.0 (X11; Linux x86_64) personal-price-watch/1.0';
  */
 export const abAdapter: RetailerAdapter = {
   id: 'ab',
+  // NOT routed through residential egress, deliberately. AB's Akamai hard-blocks
+  // the residential-proxy IP pool at the *connection* level on its /api/v1/
+  // GraphQL endpoint (verified: 502 "cannot connect target url" even with a
+  // headless-browser render, from a genuine Greek residential IP), while a clean
+  // consumer IP (your home connection / the launchd scrape) gets through. Both
+  // searchProducts AND scrapeProduct hit that same endpoint, so a scraping API
+  // can't serve AB — flagging it would only make every AB search hang ~57s on the
+  // proxy's tarpit timeout before failing, worse than the current instant 403.
+  // AB keeps getting daily prices via the off-edge scrape (scripts/scrape-local.ts);
+  // live edge discovery of new AB products isn't available until the adapter is
+  // reworked to parse AB's server-rendered search *page* (its HTML pages ARE
+  // reachable through the proxy) instead of the blocked GraphQL API.
 
   async scrapeProduct(url, fetchImpl, hints) {
     const skuMatch = url.match(SKU_FROM_URL_PATTERN);
