@@ -17,6 +17,12 @@ directory = "../web/dist"
 # [triggers]
 # crons = ["15 5 * * *"]
 
+# Ship console.* to Workers Logs (included in the free plan) so per-chain
+# search/scrape failures — the intermittent 403s especially — are attributable
+# from the dashboard instead of only flashing by in a client's errors[].
+[observability]
+enabled = true
+
 [[d1_databases]]
 binding = "DB"
 database_name = "grocery-prices"

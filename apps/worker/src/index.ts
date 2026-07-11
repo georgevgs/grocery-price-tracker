@@ -14,7 +14,7 @@ import { adapterRegistry } from '@grocery/scrapers/registry';
 import { queryTokens } from '@grocery/scrapers/kritikos';
 import { abQueryTokens } from '@grocery/scrapers/ab';
 import type { RetailerAdapter, SearchHints } from '@grocery/scrapers/types';
-import { athensDate, runScrape, type Env } from './scrape';
+import { athensDate, edgeFetch, runScrape, type Env } from './scrape';
 import { lookupBarcode, type BarcodeInfo } from './openfoodfacts';
 
 interface ProductRow {
@@ -245,7 +245,9 @@ app.get('/api/retailer-search', async (c) => {
 
     // A throw here (a failed chain) skips the write below and surfaces in
     // errors[], so failures always retry live and never poison the cache.
-    const found = await adapter.searchProducts(query, fetch, searchHints);
+    // edgeFetch adds timeout + one polite retry (see scrape.ts) so a
+    // transient WAF/5xx blip doesn't cost the chain this search.
+    const found = await adapter.searchProducts(query, edgeFetch, searchHints);
     await writeSearchCache(c.env, adapter.id, query, eanKey, found);
     return found;
   };
@@ -265,7 +267,11 @@ app.get('/api/retailer-search', async (c) => {
     if ('fulfilled' === outcome.status) {
       results[adapter.id] = outcome.value;
     } else {
-      errors.push(outcome.reason instanceof Error ? outcome.reason.message : String(outcome.reason));
+      const message = outcome.reason instanceof Error ? outcome.reason.message : String(outcome.reason);
+      errors.push(message);
+      // errors[] only reaches the requesting client; mirror to the log so
+      // Workers Logs can show WHICH chain 403s/5xxes and how often.
+      console.error(`[retailer-search] q="${query}": ${message}`);
     }
   });
 
@@ -310,9 +316,11 @@ app.get('/api/barcode/:ean', async (c) => {
 /**
  * Seed today's price_history for freshly linked listings from the price the
  * client already observed (search tile / resolve-url). Without this, the price
- * shown after saving depends on the immediate /api/scrape/run, which runs on the
- * edge with a plain fetch and so 403/503s on the WAF-blocked chains (AB,
- * Kritikos, Sklavenitis) — they'd read "—" until the next off-edge daily scrape.
+ * shown after saving depends on the immediate /api/scrape/run — which now
+ * prices the edge-blocked chains (AB, Kritikos) from their D1 catalog indexes
+ * instead of 403-ing, but still can't cover a SKU the daily crawl hasn't seen
+ * yet — so seeding from what the client just saw stays the instant, reliable
+ * path.
  *
  * Resolves each listing's id by its (product_id, retailer, retailer_sku) unique
  * key via INSERT…SELECT, so it works whether the listings were just batch- or
@@ -510,7 +518,7 @@ app.post('/api/resolve-url', async (c) => {
   }
 
   try {
-    const scraped = await adapter.scrapeProduct(url, fetch, {
+    const scraped = await adapter.scrapeProduct(url, edgeFetch, {
       productTitle: payload.productTitle,
     });
 
@@ -529,6 +537,7 @@ app.post('/api/resolve-url', async (c) => {
     });
   } catch (error) {
     const message = error instanceof Error ? error.message : 'scrape failed';
+    console.error(`[resolve-url] ${url}: ${message}`);
     return c.json({ error: message }, 502);
   }
 });

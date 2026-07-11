@@ -22,6 +22,14 @@ So the daily scrape runs **here, on your Mac**, not on Cloudflare:
 - `eu.vagdas.grocery-scrape.plist` — launchd schedule (08:15 Athens, matching the
   old `05:15 UTC` cron).
 
+How it fetches (politeness, `@grocery/scrapers/polite`): every request carries a
+timeout and bounded retries (backoff + jitter on 429/5xx/network errors, one
+delayed retry on 403); chains run in parallel but listings within one chain go
+sequentially with a jittered gap; the AB catalog crawl paces its ~240 pages
+~350 ms apart. AB and Kritikos listings are priced **from the catalog crawl
+itself** — no per-listing requests to the two most block-prone chains unless a
+SKU is missing from the crawl (then a paced live fetch covers it).
+
 Cloudflare still hosts the PWA and the read API; only the fetching moved. The
 edge cron in `wrangler.toml` is commented out so there's a single writer.
 

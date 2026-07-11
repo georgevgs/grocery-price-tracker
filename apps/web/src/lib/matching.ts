@@ -290,6 +290,13 @@ export const searchAndRank = async (
   // The canonical chain list, used when a pass targets "everyone" (subset
   // undefined) so the progress board knows which rows to light up.
   const allRetailers: readonly RetailerId[] = [...RETAILER_LABELS.keys()];
+  // Retry sets derive from THIS list, not from ranked.keys(): ranked only
+  // holds chains that returned a response, so keying retries off it silently
+  // dropped any chain whose first pass ERRORED (a transient 403/5xx) from
+  // every later pass — exactly the chains a retry exists to rescue. A chain
+  // with no results yet scores -1 via topScore, so it stays "weak" either way.
+  const targeted: readonly RetailerId[] =
+    undefined !== retailers && 0 < retailers.length ? retailers : allRetailers;
 
   const topScore = (retailer: RetailerId): number => {
     return ranked.get(retailer)?.[0]?.score ?? -1;
@@ -331,7 +338,7 @@ export const searchAndRank = async (
       continue;
     }
 
-    const weakChains = [...ranked.keys()].filter(
+    const weakChains = targeted.filter(
       (retailer) => topScore(retailer) < SUGGESTION_THRESHOLD,
     );
 
@@ -358,7 +365,7 @@ export const searchAndRank = async (
     }
 
     if (null !== discoveredEan) {
-      const eanChains = [...ranked.keys()].filter(
+      const eanChains = targeted.filter(
         (retailer) =>
           EAN_CAPABLE_RETAILERS.has(retailer) && topScore(retailer) < EAN_DISCOVERY_THRESHOLD,
       );

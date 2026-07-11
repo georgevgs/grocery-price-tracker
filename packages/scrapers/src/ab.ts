@@ -1,5 +1,6 @@
 import type { RetailerSearchResult } from '@grocery/core/types';
 import { normalizeTitle } from '@grocery/core/normalize';
+import { jittered, sleep } from './polite';
 import { AdapterError, toGreekFloat, type RetailerAdapter } from './types';
 
 const GRAPHQL_URL = 'https://www.ab.gr/api/v1/';
@@ -171,17 +172,22 @@ const isObject = (value: unknown): value is JsonObject => {
 };
 
 export const mapSearchResponse = (body: unknown, url: string): RetailerSearchResult[] => {
-  if (isObject(body) && Array.isArray(body['errors']) && 0 < body['errors'].length) {
-    const first: unknown = body['errors'][0];
-    const message = isObject(first) && 'string' === typeof first['message'] ? first['message'] : 'GraphQL error';
-    throw new AdapterError('ab', url, `${message} — the persisted-query hash may have rotated`);
-  }
-
   const data = isObject(body) ? body['data'] : undefined;
   const productSearch = isObject(data) ? data['productSearch'] : undefined;
   const products = isObject(productSearch) ? productSearch['products'] : undefined;
 
+  // errors[] is only fatal when NO usable tile list came with it. AB's gateway
+  // also reports PARTIAL failures through errors[] — observed live 2026-07-11:
+  // one tile's null `code` errors the page ("Parameter code must not be null")
+  // while the rest of the tiles parse fine — and throwing on those threw away
+  // a whole page (and killed the catalog crawl) over one broken product.
   if (false === Array.isArray(products)) {
+    if (isObject(body) && Array.isArray(body['errors']) && 0 < body['errors'].length) {
+      const first: unknown = body['errors'][0];
+      const message = isObject(first) && 'string' === typeof first['message'] ? first['message'] : 'GraphQL error';
+      throw new AdapterError('ab', url, `${message} — the persisted-query hash may have rotated`);
+    }
+
     throw new AdapterError('ab', url, 'unexpected response shape: data.productSearch.products missing');
   }
 
@@ -303,6 +309,23 @@ const CATALOG_QUERY = ':relevance';
 const CATALOG_PAGE_SIZE = 50;
 /** Backstop so a bogus totalPages can't loop forever (~12k/50 ≈ 243 real pages). */
 const CATALOG_MAX_PAGES = 1000;
+/**
+ * Gap between crawl pages (jittered ±25%). ~243 back-to-back requests is
+ * exactly the burst shape a WAF rate-scores; ~350ms apart stretches the crawl
+ * by only ~1.5 min a day and keeps it looking like browsing, not a hammer.
+ */
+const CATALOG_PAGE_DELAY_MS = 350;
+/**
+ * A few pages may fail without failing the crawl. AB's gateway can error a
+ * single page over one poisoned tile (observed live 2026-07-11: "Parameter
+ * code must not be null" on page 239 of 240, with data null), and one bad
+ * page must not leave the WHOLE 12k-row index stale until AB fixes its data
+ * — a skipped page's ~50 rows miss this run's indexed_at re-stamp and are
+ * pruned, but they return with the next clean crawl; stale prices don't.
+ * The budget is small so systemic breakage (a rotated persisted-query hash
+ * erroring EVERY page) still fails the crawl loudly instead of degrading it.
+ */
+const CATALOG_MAX_FAILED_PAGES = 12;
 
 const extractTotalPages = (body: unknown): number => {
   const data = isObject(body) ? body['data'] : undefined;
@@ -365,12 +388,19 @@ const toAbCatalogEntry = (result: RetailerSearchResult): AbCatalogEntry => ({
  * (CATALOG_QUERY) at CATALOG_PAGE_SIZE until every page is read, deduping by SKU
  * (a product can recur across pages as the backing result set shifts). Reuses
  * mapSearchResponse via fetchProductSearchPage so index rows match live-search
- * listings field-for-field. Sequential on purpose — one gentle daily crawl, not
- * a burst that trips AB's WAF.
+ * listings field-for-field. Sequential AND paced on purpose — one gentle daily
+ * crawl, not a burst that trips AB's WAF (see CATALOG_PAGE_DELAY_MS; tests
+ * pass pageDelayMs: 0 to stay instant).
  */
 export const buildAbCatalogIndex = async (
   fetchImpl: typeof fetch,
+  options?: {
+    pageDelayMs?: number;
+    /** Fired per skipped page so the caller can log it — the crawl stays pure. */
+    onPageError?: (pageNumber: number, error: unknown) => void;
+  },
 ): Promise<AbCatalogEntry[]> => {
+  const pageDelayMs = options?.pageDelayMs ?? CATALOG_PAGE_DELAY_MS;
   const entries: AbCatalogEntry[] = [];
   const seen = new Set<string>();
 
@@ -383,14 +413,31 @@ export const buildAbCatalogIndex = async (
     }
   };
 
+  // Page 0 has no skip budget: totalPages comes from it, and a crawl that
+  // can't even start should fail loudly, not return an empty "success" that
+  // the uploader's empty-crawl guard has to catch.
   const first = await fetchProductSearchPage(CATALOG_QUERY, fetchImpl, 0, CATALOG_PAGE_SIZE);
   collect(first.results);
 
   const totalPages = Math.min(first.totalPages, CATALOG_MAX_PAGES);
+  let failedPages = 0;
 
   for (let pageNumber = 1; pageNumber < totalPages; pageNumber += 1) {
-    const page = await fetchProductSearchPage(CATALOG_QUERY, fetchImpl, pageNumber, CATALOG_PAGE_SIZE);
-    collect(page.results);
+    if (0 < pageDelayMs) {
+      await sleep(jittered(pageDelayMs));
+    }
+
+    try {
+      const page = await fetchProductSearchPage(CATALOG_QUERY, fetchImpl, pageNumber, CATALOG_PAGE_SIZE);
+      collect(page.results);
+    } catch (error) {
+      failedPages += 1;
+      options?.onPageError?.(pageNumber, error);
+
+      if (CATALOG_MAX_FAILED_PAGES < failedPages) {
+        throw error;
+      }
+    }
   }
 
   return entries;

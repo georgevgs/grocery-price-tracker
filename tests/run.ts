@@ -330,8 +330,61 @@ const abCatalogFetch = (async (input: Parameters<typeof fetch>[0]) => {
   return new Response(JSON.stringify(abCatalogPage(pageNumber)));
 }) as typeof fetch;
 
-const abIndex = await buildAbCatalogIndex(abCatalogFetch);
+const abIndex = await buildAbCatalogIndex(abCatalogFetch, { pageDelayMs: 0 });
 assert.equal(abIndex.length, 3); // 4 tiles across 2 pages, sku 200 deduped
+
+// A PARTIAL-failure response (errors[] alongside a usable tile list — AB
+// reports one poisoned tile this way, observed live 2026-07-11) must parse
+// the surviving tiles, not throw; errors[] stays fatal only when no tile
+// list came with it (hash rotation / hard failure).
+const abPartial = mapSearchResponse(
+  {
+    errors: [{ message: 'Parameter code must not be null' }],
+    data: {
+      productSearch: {
+        products: [{ code: '400', name: 'Γάλα Πλήρες 1lt', price: { value: 1.5 } }],
+      },
+    },
+  },
+  'https://www.ab.gr/api/v1/',
+);
+assert.equal(abPartial.length, 1);
+assert.equal(abPartial[0]?.sku, '400');
+assert.throws(
+  () => mapSearchResponse({ errors: [{ message: 'PersistedQueryNotFound' }] }, 'https://www.ab.gr/api/v1/'),
+  /PersistedQueryNotFound/,
+);
+
+// A single failed crawl page is SKIPPED (logged via onPageError), not fatal —
+// one data-poisoned page must not leave the whole index stale. Page 0 keeps
+// no such budget: totalPages comes from it.
+const abFlakyFetch = (async (input: Parameters<typeof fetch>[0]) => {
+  const url = 'string' === typeof input ? input : input.toString();
+  const rawVars = new URL(url).searchParams.get('variables') ?? '{}';
+  const pageNumber = Number(JSON.parse(rawVars).pageNumber ?? 0);
+
+  if (1 === pageNumber) {
+    return new Response(JSON.stringify({ errors: [{ message: 'Parameter code must not be null' }] }));
+  }
+
+  return new Response(JSON.stringify(abCatalogPage(pageNumber)));
+}) as typeof fetch;
+
+const skippedPages: number[] = [];
+const abFlakyIndex = await buildAbCatalogIndex(abFlakyFetch, {
+  pageDelayMs: 0,
+  onPageError: (pageNumber) => skippedPages.push(pageNumber),
+});
+assert.deepEqual(skippedPages, [1]);
+assert.equal(abFlakyIndex.length, 2); // page 0's tiles survive; page 1's are skipped
+
+const abDeadFetch = (async () => {
+  return new Response(JSON.stringify({ errors: [{ message: 'PersistedQueryNotFound' }] }));
+}) as typeof fetch;
+await assert.rejects(
+  () => buildAbCatalogIndex(abDeadFetch, { pageDelayMs: 0 }),
+  /PersistedQueryNotFound/,
+);
 
 const abMilk = abIndex.find((entry) => '100' === entry.sku);
 assert.ok(undefined !== abMilk);

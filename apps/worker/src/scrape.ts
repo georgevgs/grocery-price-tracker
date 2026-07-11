@@ -1,5 +1,6 @@
 import type { RetailerId, ScrapedListing } from '@grocery/core/types';
 import { extractSize } from '@grocery/core/normalize';
+import { withPoliteness } from '@grocery/scrapers/polite';
 import { adapterRegistry } from '@grocery/scrapers/registry';
 import { ListingGoneError } from '@grocery/scrapers/types';
 
@@ -13,9 +14,24 @@ export interface Env {
   WRITE_TOKEN?: string;
 }
 
+/**
+ * Politeness budget for LIVE edge fetches (interactive search, resolve-url,
+ * scrape/run): a short timeout and a single retry keep interactive latency
+ * bounded while still absorbing a transient 5xx or WAF-scoring hiccup —
+ * Cloudflare's shared egress IPs are reputation-scored, so one jittered,
+ * delayed re-attempt beats an instant re-hit that feeds the score.
+ */
+export const edgeFetch = withPoliteness(fetch, {
+  timeoutMs: 10_000,
+  retries: 1,
+  baseDelayMs: 400,
+  forbiddenDelayMs: 1_000,
+});
+
 interface ListingRow {
   id: number;
   retailer: string;
+  retailer_sku: string;
   url: string;
   product_id: number;
   product_brand: string;
@@ -31,9 +47,37 @@ export interface ScrapeRunResult {
   warnings: string[];
 }
 
+/**
+ * Live edge fetches run at most this many at once. The old unbounded
+ * Promise.all fired every listing simultaneously from one shared egress IP —
+ * exactly the burst shape retailer WAFs rate-score — and it also diverged from
+ * the local job's politeness (its pool of 4). Same bound on both paths.
+ */
+const EDGE_SCRAPE_CONCURRENCY = 4;
+
+/** Bounded-concurrency map — mirrors the local scrape's pool. */
+const mapPool = async <T, R>(
+  items: readonly T[],
+  limit: number,
+  fn: (item: T) => Promise<R>,
+): Promise<R[]> => {
+  const out = new Array<R>(items.length);
+  let next = 0;
+
+  const worker = async (): Promise<void> => {
+    while (next < items.length) {
+      const index = next++;
+      out[index] = await fn(items[index] as T);
+    }
+  };
+
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
+  return out;
+};
+
 export const runScrape = async (env: Env): Promise<ScrapeRunResult> => {
   const { results } = await env.DB.prepare(
-    `SELECT l.id, l.retailer, l.url, p.id AS product_id,
+    `SELECT l.id, l.retailer, l.retailer_sku, l.url, p.id AS product_id,
             p.brand AS product_brand, p.title AS product_title, p.image_url AS product_image
      FROM retailer_listings l
      JOIN products p ON p.id = l.product_id`,
@@ -42,10 +86,8 @@ export const runScrape = async (env: Env): Promise<ScrapeRunResult> => {
   const scrapedDate = athensDate();
   const scrapedAt = new Date().toISOString();
 
-  // Listings are independent — scrape them concurrently. Basket-sized
-  // workloads stay far below Workers' subrequest limits.
-  const outcomes = await Promise.all(
-    results.map((listing) => scrapeOne(env, listing, scrapedDate, scrapedAt)),
+  const outcomes = await mapPool(results, EDGE_SCRAPE_CONCURRENCY, (listing) =>
+    scrapeOne(env, listing, scrapedDate, scrapedAt),
   );
 
   const errors = outcomes
@@ -54,6 +96,16 @@ export const runScrape = async (env: Env): Promise<ScrapeRunResult> => {
   const warnings = outcomes
     .map((outcome) => outcome.warning)
     .filter((warning): warning is string => undefined !== warning);
+
+  // errors[] only reaches the caller's JSON response; mirror them to the log
+  // so Workers Logs can attribute which chain fails (and how often) without
+  // anyone watching the UI.
+  for (const error of errors) {
+    console.error(`[scrape] ${error}`);
+  }
+  for (const warning of warnings) {
+    console.warn(`[scrape] ${warning}`);
+  }
 
   return {
     ok: outcomes.length - errors.length,
@@ -76,6 +128,61 @@ export interface ScrapeOutcome {
   warning?: string;
 }
 
+/**
+ * Chains whose WAF/CDN blocks Cloudflare's egress IPs (403/503 on every edge
+ * fetch) — a live scrape from here is a GUARANTEED failure, so their prices
+ * come from the D1 catalog indexes the off-edge daily crawl maintains instead.
+ * The row is at most a day old — the same freshness the daily scrape gives.
+ */
+const CATALOG_PRICED: ReadonlySet<RetailerId> = new Set<RetailerId>(['ab', 'kritikos']);
+
+interface CatalogPriceRow {
+  name: string;
+  price_piece: number | null;
+  price_unit: number | null;
+  unit_label: string | null;
+  image_url: string | null;
+}
+
+/**
+ * Price one edge-blocked listing from its chain's catalog index. Throws (like
+ * an adapter would) when the SKU isn't indexed — delisted, or the daily crawl
+ * hasn't seen it yet — or when the table itself is missing/unmigrated, so the
+ * failure surfaces in errors[] instead of writing nothing silently.
+ */
+const scrapeFromCatalog = async (env: Env, listing: ListingRow): Promise<ScrapedListing> => {
+  const table = 'ab' === listing.retailer ? 'ab_catalog' : 'kritikos_catalog';
+
+  let row: CatalogPriceRow | null;
+
+  try {
+    row =
+      (await env.DB.prepare(
+        `SELECT name, price_piece, price_unit, unit_label, image_url FROM ${table} WHERE sku = ?`,
+      )
+        .bind(listing.retailer_sku)
+        .first<CatalogPriceRow>()) ?? null;
+  } catch {
+    throw new Error(`[${listing.retailer}] catalog index table missing — run the daily scrape once to build it`);
+  }
+
+  if (null === row) {
+    throw new Error(
+      `[${listing.retailer}] sku ${listing.retailer_sku} not in the catalog index — ` +
+        'delisted, or not yet crawled by the daily scrape',
+    );
+  }
+
+  return {
+    name: row.name,
+    sku: listing.retailer_sku,
+    pricePiece: row.price_piece,
+    priceUnit: row.price_unit,
+    unitLabel: row.unit_label,
+    imageUrl: row.image_url,
+  };
+};
+
 const scrapeOne = async (
   env: Env,
   listing: ListingRow,
@@ -91,10 +198,12 @@ const scrapeOne = async (
   try {
     // Same query shape as discovery — titles alone ("Light σε φέτες
     // 175g") are too generic for the AB search to surface the SKU.
-    const scraped = await adapter.scrapeProduct(listing.url, fetch, {
-      productTitle: `${listing.product_brand} ${listing.product_title}`.trim(),
-      productBrand: listing.product_brand,
-    });
+    const scraped = CATALOG_PRICED.has(adapter.id)
+      ? await scrapeFromCatalog(env, listing)
+      : await adapter.scrapeProduct(listing.url, edgeFetch, {
+          productTitle: `${listing.product_brand} ${listing.product_title}`.trim(),
+          productBrand: listing.product_brand,
+        });
 
     const priceError = missingPriceError(listing.id, listing.retailer, scraped);
 

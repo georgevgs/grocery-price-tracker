@@ -15,6 +15,13 @@
  * It reuses the adapters and the worker's pure helpers (unit-price sanity,
  * failure classification) verbatim, so behaviour matches the cron exactly.
  *
+ * SCRAPING SHAPE (politeness): every fetch goes through withPoliteness
+ * (timeout, retry with backoff+jitter on 429/5xx/network, one delayed 403
+ * retry); chains run in parallel but listings within a chain are paced
+ * serially (SAME_CHAIN_DELAY_MS); and the AB/Kritikos listings are priced
+ * from the catalog crawl this job performs anyway, so those chains see no
+ * per-listing traffic at all unless a SKU is missing from the crawl.
+ *
  *   npm run scrape:local --workspace apps/worker                # scrape + write
  *   npm run scrape:local --workspace apps/worker -- --dry-run   # fetch only
  */
@@ -23,25 +30,47 @@ import { mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import type { RetailerId } from '@grocery/core/types';
+import type { RetailerId, ScrapedListing } from '@grocery/core/types';
 import { adapterRegistry } from '@grocery/scrapers/registry';
 import { buildCatalogIndex, type KritikosCatalogEntry } from '@grocery/scrapers/kritikos';
 import { buildAbCatalogIndex, type AbCatalogEntry } from '@grocery/scrapers/ab';
+import { jittered, sleep, withPoliteness } from '@grocery/scrapers/polite';
 import { missingPriceError, scrapeFailureOutcome, unitPriceSanityWarning } from '../src/scrape';
 
 const WORKER_DIR = join(dirname(fileURLToPath(import.meta.url)), '..');
 const DATABASE = 'grocery-prices';
-const CONCURRENCY = 4;
 const DRY_RUN = process.argv.includes('--dry-run');
 
+/**
+ * Gap between two requests to the SAME chain (jittered ±25%). Chains run in
+ * parallel — they're distinct hosts — but within one chain listings go one at
+ * a time: the retailer sees a slow, browser-paced trickle instead of the
+ * 4-at-once bursts the old shared pool could aim at a single host.
+ */
+const SAME_CHAIN_DELAY_MS = 600;
+
+/** Product pages / per-listing API calls: default politeness (20s, 2 retries). */
+const politeFetch = withPoliteness(fetch);
+
+/**
+ * Catalog crawls: same retry policy, but the Kritikos catalog streams ~29 MB
+ * in ONE response and the politeness timeout keeps ticking while a body
+ * streams — so this budget must cover the whole transfer, not just TTFB.
+ */
+const catalogFetch = withPoliteness(fetch, { timeoutMs: 240_000 });
+
+/** Chains priced from their daily catalog crawl instead of per-listing fetches. */
+const CATALOG_PRICED: ReadonlySet<string> = new Set(['ab', 'kritikos']);
+
 const TARGET_QUERY =
-  `SELECT l.id, l.retailer, l.url, p.id AS product_id, ` +
+  `SELECT l.id, l.retailer, l.retailer_sku, l.url, p.id AS product_id, ` +
   `p.brand AS product_brand, p.title AS product_title, p.image_url AS product_image ` +
   `FROM retailer_listings l JOIN products p ON p.id = l.product_id`;
 
 interface TargetRow {
   id: number;
   retailer: string;
+  retailer_sku: string;
   url: string;
   product_id: number;
   product_brand: string;
@@ -103,32 +132,42 @@ const loadTargets = (): TargetRow[] => {
   return results as TargetRow[];
 };
 
-/** Bounded-concurrency map — gentler on the retailers than the Worker's unbounded fan-out. */
-const mapPool = async <T, R>(
-  items: readonly T[],
-  limit: number,
-  fn: (item: T) => Promise<R>,
-): Promise<R[]> => {
-  const out = new Array<R>(items.length);
-  let next = 0;
-
-  const worker = async (): Promise<void> => {
-    while (next < items.length) {
-      const index = next++;
-      out[index] = await fn(items[index] as T);
-    }
-  };
-
-  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
-  return out;
-};
-
 interface Outcome {
   price?: PriceWrite;
   image?: ImageBackfill;
   error?: string;
   warning?: string;
 }
+
+/** Shared post-processing for a resolved listing, live-scraped or catalog-read. */
+const outcomeFromScraped = (target: TargetRow, scraped: ScrapedListing): Outcome => {
+  const priceError = missingPriceError(target.id, target.retailer, scraped);
+
+  if (undefined !== priceError) {
+    return { error: priceError };
+  }
+
+  const price: PriceWrite = {
+    listingId: target.id,
+    pricePiece: scraped.pricePiece,
+    priceUnit: scraped.priceUnit,
+    unitLabel: scraped.unitLabel,
+  };
+
+  // Backfill the product shot the first time a listing exposes one — same
+  // IS NULL guard as the Worker, so a manual/earlier image is never lost.
+  const image: ImageBackfill | undefined =
+    null === target.product_image && 'string' === typeof scraped.imageUrl && 0 < scraped.imageUrl.length
+      ? { productId: target.product_id, imageUrl: scraped.imageUrl }
+      : undefined;
+
+  const warning = unitPriceSanityWarning(
+    { id: target.id, retailer: target.retailer, product_title: target.product_title },
+    scraped,
+  );
+
+  return undefined === warning ? { price, image } : { price, image, warning };
+};
 
 const scrapeOne = async (target: TargetRow): Promise<Outcome> => {
   const adapter = adapterRegistry.get(target.retailer as RetailerId);
@@ -138,40 +177,83 @@ const scrapeOne = async (target: TargetRow): Promise<Outcome> => {
   }
 
   try {
-    const scraped = await adapter.scrapeProduct(target.url, fetch, {
+    const scraped = await adapter.scrapeProduct(target.url, politeFetch, {
       productTitle: `${target.product_brand} ${target.product_title}`.trim(),
       productBrand: target.product_brand,
     });
 
-    const priceError = missingPriceError(target.id, target.retailer, scraped);
-
-    if (undefined !== priceError) {
-      return { error: priceError };
-    }
-
-    const price: PriceWrite = {
-      listingId: target.id,
-      pricePiece: scraped.pricePiece,
-      priceUnit: scraped.priceUnit,
-      unitLabel: scraped.unitLabel,
-    };
-
-    // Backfill the product shot the first time a listing exposes one — same
-    // IS NULL guard as the Worker, so a manual/earlier image is never lost.
-    const image: ImageBackfill | undefined =
-      null === target.product_image && 'string' === typeof scraped.imageUrl && 0 < scraped.imageUrl.length
-        ? { productId: target.product_id, imageUrl: scraped.imageUrl }
-        : undefined;
-
-    const warning = unitPriceSanityWarning(
-      { id: target.id, retailer: target.retailer, product_title: target.product_title },
-      scraped,
-    );
-
-    return undefined === warning ? { price, image } : { price, image, warning };
+    return outcomeFromScraped(target, scraped);
   } catch (error) {
     return scrapeFailureOutcome(target.id, error);
   }
+};
+
+/** One chain's listings, one at a time, with a jittered gap between them. */
+const scrapeSequentially = async (group: readonly TargetRow[]): Promise<Outcome[]> => {
+  const outcomes: Outcome[] = [];
+
+  for (const [index, target] of group.entries()) {
+    if (0 < index) {
+      await sleep(jittered(SAME_CHAIN_DELAY_MS));
+    }
+
+    outcomes.push(await scrapeOne(target));
+  }
+
+  return outcomes;
+};
+
+/** Chains in parallel (distinct hosts), listings within a chain paced serially. */
+const scrapeByRetailer = async (targets: readonly TargetRow[]): Promise<Outcome[]> => {
+  const groups = new Map<string, TargetRow[]>();
+
+  for (const target of targets) {
+    const group = groups.get(target.retailer) ?? [];
+    group.push(target);
+    groups.set(target.retailer, group);
+  }
+
+  const perChain = await Promise.all([...groups.values()].map(scrapeSequentially));
+  return perChain.flat();
+};
+
+/**
+ * Price a catalog-crawled chain's listings from the entries the crawl just
+ * fetched instead of re-hitting the retailer once per listing: the crawl
+ * already carries every product's current price, and the per-listing path was
+ * the most block-prone traffic this job sent (an AB listing costs 1-2 search
+ * calls). Live scraping remains only as the paced fallback for a SKU the
+ * crawl missed — or for the whole chain when the crawl itself failed (null).
+ */
+const priceFromCatalog = async (
+  targets: readonly TargetRow[],
+  entries: ReadonlyArray<KritikosCatalogEntry | AbCatalogEntry> | null,
+): Promise<Outcome[]> => {
+  const bySku = new Map((entries ?? []).map((entry) => [entry.sku, entry]));
+  const outcomes: Outcome[] = [];
+  const misses: TargetRow[] = [];
+
+  for (const target of targets) {
+    const entry = bySku.get(target.retailer_sku);
+
+    if (undefined === entry) {
+      misses.push(target);
+      continue;
+    }
+
+    outcomes.push(
+      outcomeFromScraped(target, {
+        name: entry.name,
+        sku: entry.sku,
+        pricePiece: entry.pricePiece,
+        priceUnit: entry.priceUnit,
+        unitLabel: entry.unitLabel,
+        imageUrl: entry.imageUrl,
+      }),
+    );
+  }
+
+  return [...outcomes, ...(await scrapeSequentially(misses))];
 };
 
 // --- SQL literal builders (D1's CLI has no bind params, so escape by hand) ---
@@ -270,15 +352,33 @@ const writeCatalogIndex = (entries: readonly KritikosCatalogEntry[], indexedAt: 
   writeResults(`DELETE FROM kritikos_catalog WHERE indexed_at < ${sqlStr(indexedAt)};`);
 };
 
-const runCatalogIndex = async (indexedAt: string): Promise<void> => {
-  // Fully self-contained: any failure here (catalog fetch, a chunk upload) is
-  // logged and swallowed so it can never sink the price scrape that already ran
-  // or mark the job fatal — the edge just keeps serving the previous index.
+/**
+ * Crawl the Kritikos catalog into entries. Self-contained: a failure is logged
+ * and returns null, so it can never sink the price scrape — the AB/Kritikos
+ * listings then fall back to live per-listing scraping (priceFromCatalog) and
+ * the edge keeps serving the previous index (uploadKritikosIndex skips null).
+ */
+const crawlKritikosCatalog = async (): Promise<KritikosCatalogEntry[] | null> => {
   try {
-    console.log('[scrape-local] building Kritikos catalog index...');
-    const entries = await buildCatalogIndex(fetch);
+    console.log('[scrape-local] crawling Kritikos catalog...');
+    const entries = await buildCatalogIndex(catalogFetch);
     console.log(`[scrape-local] Kritikos catalog: ${entries.length} product(s)`);
+    return entries;
+  } catch (error) {
+    console.error(
+      `[scrape-local] Kritikos catalog crawl failed: ${error instanceof Error ? error.message : String(error)}`,
+    );
+    return null;
+  }
+};
 
+const uploadKritikosIndex = (entries: readonly KritikosCatalogEntry[] | null, indexedAt: string): void => {
+  // Crawl failed (already logged): the edge keeps serving the previous index.
+  if (null === entries) {
+    return;
+  }
+
+  try {
     if (DRY_RUN) {
       const sample = entries.slice(0, 3).map((entry) => `  - ${entry.sku} ${entry.name}`).join('\n');
       console.log(`[scrape-local] dry run — would index ${entries.length} Kritikos product(s):\n${sample}`);
@@ -337,12 +437,35 @@ const writeAbCatalogIndex = (entries: readonly AbCatalogEntry[], indexedAt: stri
   writeResults(`DELETE FROM ab_catalog WHERE indexed_at < ${sqlStr(indexedAt)};`);
 };
 
-const runAbCatalogIndex = async (indexedAt: string): Promise<void> => {
+/** AB counterpart of crawlKritikosCatalog — same null-on-failure contract. */
+const crawlAbCatalog = async (): Promise<AbCatalogEntry[] | null> => {
   try {
-    console.log('[scrape-local] building AB catalog index...');
-    const entries = await buildAbCatalogIndex(fetch);
+    console.log('[scrape-local] crawling AB catalog...');
+    const entries = await buildAbCatalogIndex(catalogFetch, {
+      // A skipped page (AB data-poisons single pages sometimes) is worth a
+      // line in the log but must not kill the crawl — see the skip budget in
+      // buildAbCatalogIndex.
+      onPageError: (pageNumber, error) =>
+        console.warn(
+          `[scrape-local]   ab catalog page ${pageNumber} skipped: ${error instanceof Error ? error.message : String(error)}`,
+        ),
+    });
     console.log(`[scrape-local] AB catalog: ${entries.length} product(s)`);
+    return entries;
+  } catch (error) {
+    console.error(
+      `[scrape-local] AB catalog crawl failed: ${error instanceof Error ? error.message : String(error)}`,
+    );
+    return null;
+  }
+};
 
+const uploadAbIndex = (entries: readonly AbCatalogEntry[] | null, indexedAt: string): void => {
+  if (null === entries) {
+    return;
+  }
+
+  try {
     if (DRY_RUN) {
       const sample = entries.slice(0, 3).map((entry) => `  - ${entry.sku} ${entry.name}`).join('\n');
       console.log(`[scrape-local] dry run — would index ${entries.length} AB product(s):\n${sample}`);
@@ -391,12 +514,34 @@ const writePrices = (
 const main = async (): Promise<void> => {
   console.log(`[scrape-local] loading targets from remote D1${DRY_RUN ? ' (dry run)' : ''}...`);
   const targets = loadTargets();
-  console.log(`[scrape-local] ${targets.length} listing(s) to scrape (concurrency ${CONCURRENCY})`);
+  console.log(`[scrape-local] ${targets.length} listing(s) to scrape`);
 
   const scrapedDate = athensDate();
   const scrapedAt = new Date().toISOString();
 
-  const outcomes = await mapPool(targets, CONCURRENCY, scrapeOne);
+  // Catalog crawls start first: they're the long poles of the run AND their
+  // entries price the AB/Kritikos listings, so those chains cost (almost) no
+  // per-listing requests. The live chains scrape concurrently with the crawls
+  // — different hosts, so the parallelism costs no single retailer anything.
+  const kritikosPromise = crawlKritikosCatalog();
+  const abPromise = crawlAbCatalog();
+
+  const liveTargets = targets.filter((target) => false === CATALOG_PRICED.has(target.retailer));
+  const kritikosTargets = targets.filter((target) => 'kritikos' === target.retailer);
+  const abTargets = targets.filter((target) => 'ab' === target.retailer);
+
+  const [liveOutcomes, kritikosEntries, abEntries] = await Promise.all([
+    scrapeByRetailer(liveTargets),
+    kritikosPromise,
+    abPromise,
+  ]);
+
+  const catalogOutcomes = await Promise.all([
+    priceFromCatalog(kritikosTargets, kritikosEntries),
+    priceFromCatalog(abTargets, abEntries),
+  ]);
+
+  const outcomes = [...liveOutcomes, ...catalogOutcomes.flat()];
 
   const prices = outcomes.map((o) => o.price).filter((p): p is PriceWrite => undefined !== p);
   const images = outcomes.map((o) => o.image).filter((i): i is ImageBackfill => undefined !== i);
@@ -416,11 +561,11 @@ const main = async (): Promise<void> => {
   writePrices(prices, images, scrapedDate, scrapedAt);
 
   // The catalog indexes are discovery data, independent of the tracked listings
-  // above, so they rebuild every run regardless of whether any price was written.
-  // Each is self-contained (its own try/catch), so one failing never sinks the
-  // other or the prices already written.
-  await runCatalogIndex(scrapedAt);
-  await runAbCatalogIndex(scrapedAt);
+  // above, so they upload every run regardless of whether any price was written.
+  // Each upload is self-contained (its own try/catch), so one failing never
+  // sinks the other or the prices already written.
+  uploadKritikosIndex(kritikosEntries, scrapedAt);
+  uploadAbIndex(abEntries, scrapedAt);
 };
 
 main().catch((error: unknown) => {

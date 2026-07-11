@@ -5,6 +5,7 @@
   "type": "module",
   "exports": {
     "./types": "./src/types.ts",
+    "./polite": "./src/polite.ts",
     "./sklavenitis": "./src/sklavenitis.ts",
     "./ab": "./src/ab.ts",
     "./kritikos": "./src/kritikos.ts",
