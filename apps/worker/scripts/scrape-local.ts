@@ -34,6 +34,10 @@ import type { RetailerId, ScrapedListing } from '@grocery/core/types';
 import { adapterRegistry } from '@grocery/scrapers/registry';
 import { buildCatalogIndex, type KritikosCatalogEntry } from '@grocery/scrapers/kritikos';
 import { buildAbCatalogIndex, type AbCatalogEntry } from '@grocery/scrapers/ab';
+import {
+  buildSklavenitisCatalogIndex,
+  type SklavenitisCatalogEntry,
+} from '@grocery/scrapers/sklavenitis';
 import { jittered, sleep, withPoliteness } from '@grocery/scrapers/polite';
 import { missingPriceError, scrapeFailureOutcome, unitPriceSanityWarning } from '../src/scrape';
 
@@ -487,6 +491,96 @@ const uploadAbIndex = (entries: readonly AbCatalogEntry[] | null, indexedAt: str
   }
 };
 
+// --- Sklavenitis catalog index ----------------------------------------------
+//
+// Sklavenitis's WAF intermittently 403s the edge again (see index.ts), so — like
+// AB/Kritikos — this residential job crawls its whole catalog once a day into
+// sklavenitis_catalog and the edge answers search with a cheap LIKE. But unlike
+// them, Sklavenitis stays LIVE-priced: its listings are still scraped per product
+// page above, so this index is DISCOVERY-ONLY (sku/name/url/haystack). Same
+// batched-upsert-then-prune-stale contract; same self-contained try/catch so a
+// Sklavenitis failure never sinks the prices or the other indexes.
+
+const SKLAVENITIS_CATALOG_CHUNK = 200;
+
+const sklavenitisCatalogInsert = (entry: SklavenitisCatalogEntry, indexedAt: string): string => {
+  return (
+    'INSERT OR REPLACE INTO sklavenitis_catalog (sku, name, url, haystack, indexed_at) ' +
+    `VALUES (${sqlStr(entry.sku)}, ${sqlStr(entry.name)}, ${sqlStr(entry.url)}, ` +
+    `${sqlStr(entry.haystack)}, ${sqlStr(indexedAt)});`
+  );
+};
+
+const writeSklavenitisCatalogIndex = (
+  entries: readonly SklavenitisCatalogEntry[],
+  indexedAt: string,
+): void => {
+  const statements = entries.map((entry) => sklavenitisCatalogInsert(entry, indexedAt));
+
+  for (let start = 0; start < statements.length; start += SKLAVENITIS_CATALOG_CHUNK) {
+    const chunk = statements.slice(start, start + SKLAVENITIS_CATALOG_CHUNK);
+    writeResults(chunk.join('\n'));
+    console.log(
+      `[scrape-local]   indexed ${Math.min(start + chunk.length, statements.length)}/${statements.length} (sklavenitis)`,
+    );
+  }
+
+  // Prune products that dropped out of the catalog: this run stamped every
+  // current row with indexedAt, so anything older is gone. Runs only after every
+  // insert chunk succeeded (writeResults throws otherwise).
+  writeResults(`DELETE FROM sklavenitis_catalog WHERE indexed_at < ${sqlStr(indexedAt)};`);
+};
+
+/** Sklavenitis counterpart of crawlAbCatalog — same null-on-failure contract. */
+const crawlSklavenitisCatalog = async (): Promise<SklavenitisCatalogEntry[] | null> => {
+  try {
+    console.log('[scrape-local] crawling Sklavenitis catalog...');
+    const entries = await buildSklavenitisCatalogIndex(politeFetch, {
+      onPageError: (categoryUrl, pageNumber, error) =>
+        console.warn(
+          `[scrape-local]   sklavenitis ${categoryUrl} pg${pageNumber} skipped: ${error instanceof Error ? error.message : String(error)}`,
+        ),
+    });
+    console.log(`[scrape-local] Sklavenitis catalog: ${entries.length} product(s)`);
+    return entries;
+  } catch (error) {
+    console.error(
+      `[scrape-local] Sklavenitis catalog crawl failed: ${error instanceof Error ? error.message : String(error)}`,
+    );
+    return null;
+  }
+};
+
+const uploadSklavenitisIndex = (
+  entries: readonly SklavenitisCatalogEntry[] | null,
+  indexedAt: string,
+): void => {
+  if (null === entries) {
+    return;
+  }
+
+  try {
+    if (DRY_RUN) {
+      const sample = entries.slice(0, 3).map((entry) => `  - ${entry.sku} ${entry.name}`).join('\n');
+      console.log(`[scrape-local] dry run — would index ${entries.length} Sklavenitis product(s):\n${sample}`);
+      return;
+    }
+
+    if (0 === entries.length) {
+      // Never prune against an empty crawl — that would wipe the whole index.
+      console.log('[scrape-local] Sklavenitis catalog came back empty — leaving the existing index in place.');
+      return;
+    }
+
+    writeSklavenitisCatalogIndex(entries, indexedAt);
+    console.log('[scrape-local] Sklavenitis catalog index updated.');
+  } catch (error) {
+    console.error(
+      `[scrape-local] Sklavenitis catalog index failed (prices unaffected): ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+};
+
 /** Write today's prices and image backfills — no-op when there's nothing to write. */
 const writePrices = (
   prices: readonly PriceWrite[],
@@ -560,12 +654,22 @@ const main = async (): Promise<void> => {
 
   writePrices(prices, images, scrapedDate, scrapedAt);
 
+  // Sklavenitis is BOTH live-priced (its listings are in liveTargets above) and
+  // catalog-crawled, so — unlike AB/Kritikos, whose hosts see no live fetches —
+  // its crawl must not run alongside the live Sklavenitis price fetches: one
+  // gentle stream per host. It runs here, after the live scrape is done, and
+  // after writePrices so today's prices land promptly rather than waiting on the
+  // ~8-minute crawl. AB/Kritikos crawled concurrently with the live scrape above
+  // (different hosts), so their entries are already in hand.
+  const sklavenitisEntries = await crawlSklavenitisCatalog();
+
   // The catalog indexes are discovery data, independent of the tracked listings
   // above, so they upload every run regardless of whether any price was written.
   // Each upload is self-contained (its own try/catch), so one failing never
   // sinks the other or the prices already written.
   uploadKritikosIndex(kritikosEntries, scrapedAt);
   uploadAbIndex(abEntries, scrapedAt);
+  uploadSklavenitisIndex(sklavenitisEntries, scrapedAt);
 };
 
 main().catch((error: unknown) => {

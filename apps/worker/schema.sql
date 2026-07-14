@@ -143,3 +143,37 @@ CREATE TABLE IF NOT EXISTS ab_catalog (
     image_url   TEXT,
     indexed_at  TEXT NOT NULL DEFAULT (datetime('now'))
 );
+
+-- Sklavenitis discovery index — same rationale as ab_catalog/kritikos_catalog,
+-- added 2026-07-14 when sklavenitis.gr's WAF began intermittently 403-ing the
+-- edge again (~24 search failures/day in prod, ~30% 403). The off-edge daily
+-- scrape (residential IP, unblocked) crawls the whole catalog by walking the
+-- CATEGORY pages — the Products sitemap lists only URLs, so category tiles are
+-- the only bulk source of Greek names + SKUs — and the edge answers search with
+-- a cheap `haystack LIKE ?` (searchSklavenitisCatalog in index.ts). No live edge
+-- egress, so the whole live-search failure tail goes away, not only the 403s.
+--
+-- DISCOVERY-ONLY: only sku/name/url/haystack are populated. Sklavenitis stays
+-- LIVE-priced (its listings are scraped per product page daily), so brand/price/
+-- image_url stay NULL here — the price columns exist only to mirror ab_catalog's
+-- shape so the row-read path is uniform. `haystack` is the folded name
+-- (sklavenitisHaystack) and `url` is the prebuilt product URL a search row maps
+-- straight to. `indexed_at` drives the same upsert-then-prune-stale contract.
+-- Only SEARCH reads this table; a pasted URL still resolves via a live scrape,
+-- because resolve's price seeds the new listing and this price-less index can't
+-- supply it (unlike ab_catalog/kritikos_catalog, which carry prices).
+--
+-- Pure cache: safe to drop and let the next scrape repopulate. Missing/empty →
+-- searchSklavenitisCatalog returns [] and the edge falls back to live search.
+CREATE TABLE IF NOT EXISTS sklavenitis_catalog (
+    sku         TEXT PRIMARY KEY,
+    name        TEXT NOT NULL,
+    url         TEXT NOT NULL,
+    haystack    TEXT NOT NULL,
+    brand       TEXT,
+    price_piece REAL,
+    price_unit  REAL,
+    unit_label  TEXT,
+    image_url   TEXT,
+    indexed_at  TEXT NOT NULL DEFAULT (datetime('now'))
+);

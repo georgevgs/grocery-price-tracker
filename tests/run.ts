@@ -7,7 +7,13 @@ import {
   normalizeTitle,
 } from '../packages/core/src/normalize';
 import { suggestMatches } from '../packages/core/src/match';
-import { parseProductHtml, parseSearchHtml } from '../packages/scrapers/src/sklavenitis';
+import {
+  buildSklavenitisCatalogIndex,
+  parseProductHtml,
+  parseSearchHtml,
+  sklavenitisHaystack,
+  sklavenitisQueryTokens,
+} from '../packages/scrapers/src/sklavenitis';
 import {
   abHaystack,
   abQueryTokens,
@@ -227,6 +233,73 @@ assert.ok(firstResult.url.startsWith('https://www.sklavenitis.gr/'));
 // Slug carries no code — data-productsku must fill in.
 assert.equal(milkResult.sku, '9811456');
 assert.equal(milkResult.title, 'ΟΛΥΜΠΟΣ Επιλεγμένο Φρέσκο Γάλα Ελαφρύ 1,7% Λιπαρά 1lt');
+
+// --- sklavenitis catalog index (the off-edge D1 discovery path) ------------
+
+// sklavenitisQueryTokens and sklavenitisHaystack share @grocery/core's
+// normalizeTitle, so the D1 index and the edge query fold identically — an
+// indexed row matches the same queries live search would.
+assert.deepEqual(sklavenitisQueryTokens('   '), []);
+assert.equal(sklavenitisQueryTokens('Γάλα & Φρέσκο').length, 2); // '&' folds away, no empty token
+assert.ok(sklavenitisQueryTokens('ΝΟΥΝΟΥ').every((token) => sklavenitisHaystack('ΝΟΥΝΟΥ Γάλα').includes(token)));
+
+// buildSklavenitisCatalogIndex walks the ProductCategories sitemap (index →
+// child → category URLs), keeps only the LEAF categories (path depth ≥ 3), and
+// pages each `?pg=N` until a short/empty page, parsing tiles with parseSearchHtml
+// and deduping by SKU across the whole catalog.
+const SKL_SITEMAP_INDEX = 'https://www.sklavenitis.gr/sitemap/ProductCategories/sitemap_index.xml';
+const SKL_LEAF = 'https://www.sklavenitis.gr/cat-a/sub-b/leaf-c/';
+const SKL_SHALLOW = 'https://www.sklavenitis.gr/toplevel/'; // depth 1 — must be filtered out
+
+const sklTiles = (skus: readonly number[]): string =>
+  skus
+    .map(
+      (sku) =>
+        `<h4 class="product__title"><a href="/cat-a/sub-b/leaf-c/product-${sku}/">Προϊόν ${sku}</a></h4>`,
+    )
+    .join('\n');
+
+// Page 1 is a FULL grid of 24, so the crawl must fetch page 2; page 2 is short
+// (3 tiles, one a repeat of page 1's last sku) so the crawl stops after it.
+const sklPage1 = sklTiles(Array.from({ length: 24 }, (_, i) => 100001 + i));
+const sklPage2 = sklTiles([100024, 100025, 100026]); // 100024 repeats — must dedupe
+
+const sklFetched: string[] = [];
+const sklCrawlFetch = (async (input: Parameters<typeof fetch>[0]) => {
+  const url = 'string' === typeof input ? input : input.toString();
+  sklFetched.push(url);
+
+  if (url === SKL_SITEMAP_INDEX) {
+    return new Response(`<loc>https://www.sklavenitis.gr/sitemap/ProductCategories/1.xml</loc>`);
+  }
+  if (url.endsWith('/ProductCategories/1.xml')) {
+    return new Response(`<loc>${SKL_LEAF}</loc><loc>${SKL_SHALLOW}</loc>`);
+  }
+  if (url === SKL_LEAF) {
+    return new Response(sklPage1);
+  }
+  if (url === `${SKL_LEAF}?pg=2`) {
+    return new Response(sklPage2);
+  }
+
+  // Any further page is out of range (renders zero tiles); the shallow category
+  // must never be requested at all.
+  return new Response('');
+}) as typeof fetch;
+
+const sklIndex = await buildSklavenitisCatalogIndex(sklCrawlFetch, { pageDelayMs: 0 });
+
+assert.equal(sklIndex.length, 26, '24 + 2 new (the repeated sku is deduped)');
+assert.ok(false === sklFetched.includes(SKL_SHALLOW), 'shallow category must be filtered out, not crawled');
+assert.ok(sklFetched.includes(`${SKL_LEAF}?pg=2`), 'a full first page must trigger a second');
+assert.ok(false === sklFetched.some((u) => u.includes('?pg=3')), 'a short page 2 must stop the crawl');
+
+const sklEntry = sklIndex.find((entry) => '100001' === entry.sku);
+assert.ok(undefined !== sklEntry);
+assert.equal(sklEntry.name, 'Προϊόν 100001');
+assert.equal(sklEntry.url, 'https://www.sklavenitis.gr/cat-a/sub-b/leaf-c/product-100001/');
+// The row's haystack matches the same tokens a user's query folds to.
+assert.ok(sklavenitisQueryTokens('Προϊόν').every((token) => sklEntry.haystack.includes(token)));
 
 // --- ab search response mapper ------------------------------------------
 // Shape captured live from the GetProductSearch GraphQL call.

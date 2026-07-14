@@ -13,6 +13,7 @@ import type {
 import { adapterRegistry } from '@grocery/scrapers/registry';
 import { queryTokens } from '@grocery/scrapers/kritikos';
 import { abQueryTokens } from '@grocery/scrapers/ab';
+import { sklavenitisQueryTokens } from '@grocery/scrapers/sklavenitis';
 import type { RetailerAdapter, SearchHints } from '@grocery/scrapers/types';
 import { athensDate, edgeFetch, runScrape, type Env } from './scrape';
 import { lookupBarcode, type BarcodeInfo } from './openfoodfacts';
@@ -225,16 +226,23 @@ app.get('/api/retailer-search', async (c) => {
   const eanKey = eanHint ?? '';
 
   const searchOne = async (adapter: RetailerAdapter): Promise<RetailerSearchResult[]> => {
-    // Kritikos and AB both 403/503 the edge and have no cheap live edge search
-    // (Kritikos ships none and streaming its ~29 MB catalog blows the CPU budget;
-    // AB's API is unreachable). Both are served from the D1 discovery index the
-    // off-edge daily scrape builds — a cheap LIKE, no proxy, no credits.
+    // Kritikos, AB and Sklavenitis are all served from the D1 discovery index the
+    // off-edge daily scrape builds — a cheap LIKE, no live edge egress. Kritikos
+    // and AB have no viable live edge search at all (Kritikos ships none and
+    // streaming its ~29 MB catalog blows the CPU budget; AB's API is unreachable);
+    // Sklavenitis's live search works but its WAF intermittently 403s the edge
+    // (~30% of ~24 failures/day), so it's indexed too — killing the whole
+    // live-search failure tail, not just the 403s.
     if ('kritikos' === adapter.id) {
       return searchKritikosCatalog(c.env, query, eanHint);
     }
 
     if ('ab' === adapter.id) {
       return searchAbCatalog(c.env, query);
+    }
+
+    if ('sklavenitis' === adapter.id) {
+      return searchSklavenitisCatalog(c.env, query);
     }
 
     const cached = await readSearchCache(c.env, adapter.id, query, eanKey);
@@ -1016,7 +1024,78 @@ const searchAbCatalog = async (
   }
 };
 
-/** Which chains are answered from a D1 catalog index rather than a live scrape. */
+interface SklavenitisCatalogRow {
+  sku: string;
+  name: string;
+  url: string;
+  brand: string | null;
+  price_piece: number | null;
+  price_unit: number | null;
+  unit_label: string | null;
+  image_url: string | null;
+}
+
+const SKLAVENITIS_MAX_RESULTS = 100;
+const SKLAVENITIS_COLUMNS = 'sku, name, url, brand, price_piece, price_unit, unit_label, image_url';
+
+const sklavenitisRowToResult = (row: SklavenitisCatalogRow): RetailerSearchResult => ({
+  retailer: 'sklavenitis',
+  sku: row.sku,
+  title: row.name,
+  url: row.url,
+  brand: row.brand,
+  ean: null,
+  pricePiece: row.price_piece,
+  priceUnit: row.price_unit,
+  unitLabel: row.unit_label,
+  imageUrl: row.image_url,
+});
+
+/**
+ * Answer a Sklavenitis search from the D1 discovery index the off-edge scrape
+ * builds (schema.sql, scrape-local.ts) instead of a live edge fetch its WAF
+ * intermittently 403s. Each query token becomes a `haystack LIKE ?` AND-term
+ * (same fold as the client matcher, via the shared sklavenitisQueryTokens),
+ * mirroring searchAbCatalog. Discovery-only: brand/price/image come back null and
+ * the tracked listing still gets live prices from its daily product-page scrape.
+ * Best-effort: a missing table (not migrated) or any query error returns [] so
+ * this path never 5xx-es.
+ */
+const searchSklavenitisCatalog = async (
+  env: Env,
+  query: string,
+): Promise<RetailerSearchResult[]> => {
+  const tokens = sklavenitisQueryTokens(query);
+
+  if (0 === tokens.length) {
+    return [];
+  }
+
+  try {
+    const clause = tokens
+      .map(() => `haystack LIKE ('%' || ? || '%') ESCAPE '\\'`)
+      .join(' AND ');
+    const { results } = await env.DB.prepare(
+      `SELECT ${SKLAVENITIS_COLUMNS} FROM sklavenitis_catalog WHERE ${clause} LIMIT ?`,
+    )
+      .bind(...tokens.map(escapeLike), SKLAVENITIS_MAX_RESULTS)
+      .all<SklavenitisCatalogRow>();
+
+    return results.map(sklavenitisRowToResult);
+  } catch {
+    return [];
+  }
+};
+
+/**
+ * Which chains RESOLVE a pasted URL from the D1 catalog index rather than a live
+ * scrape. Sklavenitis is deliberately absent: its catalog is discovery-only (no
+ * prices), and resolve-url's price seeds the new listing's first point
+ * (UpdateRetailersPanel), so a pasted Sklavenitis product still live-scrapes to
+ * carry today's price. Only its SEARCH is catalog-served (the dispatch above) —
+ * that's where the intermittent multi-request 403s actually bite; a single
+ * resolve fetch rarely does.
+ */
 const CATALOG_TABLES: Partial<Record<RetailerId, string>> = {
   ab: 'ab_catalog',
   kritikos: 'kritikos_catalog',
