@@ -331,12 +331,21 @@ const catalogInsert = (entry: KritikosCatalogEntry, indexedAt: string): string =
   // via LIKE '%|<ean>|%' without one barcode's digits bleeding into another's.
   const barcodes = 0 < entry.barcodes.length ? `|${entry.barcodes.join('|')}|` : '';
 
+  // UPSERT, not INSERT OR REPLACE: REPLACE deletes+reinserts under a new rowid
+  // and (with recursive_triggers off — D1's default) skips the AFTER DELETE
+  // trigger, orphaning the kritikos_catalog_fts posting. DO UPDATE keeps the
+  // rowid stable so the AFTER UPDATE trigger resyncs the FTS index. See schema.sql.
   return (
-    'INSERT OR REPLACE INTO kritikos_catalog ' +
+    'INSERT INTO kritikos_catalog ' +
     '(sku, name, url, haystack, barcodes, ean, price_piece, price_unit, unit_label, image_url, indexed_at) ' +
     `VALUES (${sqlStr(entry.sku)}, ${sqlStr(entry.name)}, ${sqlStr(entry.url)}, ${sqlStr(entry.haystack)}, ` +
     `${sqlStr(barcodes)}, ${sqlStr(entry.ean)}, ${sqlNum(entry.pricePiece)}, ${sqlNum(entry.priceUnit)}, ` +
-    `${sqlStr(entry.unitLabel)}, ${sqlStr(entry.imageUrl)}, ${sqlStr(indexedAt)});`
+    `${sqlStr(entry.unitLabel)}, ${sqlStr(entry.imageUrl)}, ${sqlStr(indexedAt)}) ` +
+    'ON CONFLICT(sku) DO UPDATE SET ' +
+    'name = excluded.name, url = excluded.url, haystack = excluded.haystack, ' +
+    'barcodes = excluded.barcodes, ean = excluded.ean, price_piece = excluded.price_piece, ' +
+    'price_unit = excluded.price_unit, unit_label = excluded.unit_label, ' +
+    'image_url = excluded.image_url, indexed_at = excluded.indexed_at;'
   );
 };
 
@@ -417,12 +426,19 @@ const uploadKritikosIndex = (entries: readonly KritikosCatalogEntry[] | null, in
 const AB_CATALOG_CHUNK = 200;
 
 const abCatalogInsert = (entry: AbCatalogEntry, indexedAt: string): string => {
+  // UPSERT, not INSERT OR REPLACE — keeps rowid stable for the ab_catalog_fts
+  // sync trigger (see catalogInsert above and schema.sql for the full rationale).
   return (
-    'INSERT OR REPLACE INTO ab_catalog ' +
+    'INSERT INTO ab_catalog ' +
     '(sku, name, url, haystack, brand, price_piece, price_unit, unit_label, image_url, indexed_at) ' +
     `VALUES (${sqlStr(entry.sku)}, ${sqlStr(entry.name)}, ${sqlStr(entry.url)}, ${sqlStr(entry.haystack)}, ` +
     `${sqlStr(entry.brand)}, ${sqlNum(entry.pricePiece)}, ${sqlNum(entry.priceUnit)}, ` +
-    `${sqlStr(entry.unitLabel)}, ${sqlStr(entry.imageUrl)}, ${sqlStr(indexedAt)});`
+    `${sqlStr(entry.unitLabel)}, ${sqlStr(entry.imageUrl)}, ${sqlStr(indexedAt)}) ` +
+    'ON CONFLICT(sku) DO UPDATE SET ' +
+    'name = excluded.name, url = excluded.url, haystack = excluded.haystack, ' +
+    'brand = excluded.brand, price_piece = excluded.price_piece, ' +
+    'price_unit = excluded.price_unit, unit_label = excluded.unit_label, ' +
+    'image_url = excluded.image_url, indexed_at = excluded.indexed_at;'
   );
 };
 
@@ -504,10 +520,15 @@ const uploadAbIndex = (entries: readonly AbCatalogEntry[] | null, indexedAt: str
 const SKLAVENITIS_CATALOG_CHUNK = 200;
 
 const sklavenitisCatalogInsert = (entry: SklavenitisCatalogEntry, indexedAt: string): string => {
+  // UPSERT, not INSERT OR REPLACE — keeps rowid stable for the
+  // sklavenitis_catalog_fts sync trigger (see schema.sql for the rationale).
   return (
-    'INSERT OR REPLACE INTO sklavenitis_catalog (sku, name, url, haystack, indexed_at) ' +
+    'INSERT INTO sklavenitis_catalog (sku, name, url, haystack, indexed_at) ' +
     `VALUES (${sqlStr(entry.sku)}, ${sqlStr(entry.name)}, ${sqlStr(entry.url)}, ` +
-    `${sqlStr(entry.haystack)}, ${sqlStr(indexedAt)});`
+    `${sqlStr(entry.haystack)}, ${sqlStr(indexedAt)}) ` +
+    'ON CONFLICT(sku) DO UPDATE SET ' +
+    'name = excluded.name, url = excluded.url, haystack = excluded.haystack, ' +
+    'indexed_at = excluded.indexed_at;'
   );
 };
 

@@ -84,8 +84,9 @@ CREATE TABLE IF NOT EXISTS search_cache (
 -- scanning it in-invocation, which blows the Workers free-plan CPU budget (a
 -- 1102/5xx) — so the edge can't do it. Instead the off-edge daily scrape
 -- (residential IP, no CPU limit — scripts/scrape-local.ts) flattens the catalog
--- into these rows once a day, and the edge answers a search with a cheap
--- `haystack LIKE ?` over ~8.5k rows (no proxy fetch, trivial CPU).
+-- into these rows once a day, and the edge answers a search from the BM25-ranked
+-- kritikos_catalog_fts index below (LIKE-scan fallback) over ~8.5k rows (no proxy
+-- fetch, trivial CPU).
 --
 -- `haystack` is the product's lowercased greeklish searchTerms (the LIKE
 -- target); `barcodes` is pipe-delimited (|a|b|) so an EAN hint matches exactly
@@ -118,8 +119,8 @@ CREATE TABLE IF NOT EXISTS kritikos_catalog (
 -- free-text catalog browse, so — exactly like kritikos_catalog above — the
 -- off-edge daily scrape (residential IP, no block, no CPU limit) crawls AB's
 -- whole ~12k-product catalog into these rows once a day, and the edge answers
--- AB search with a cheap `haystack LIKE ?` (searchAbCatalog in index.ts). No
--- proxy fetch, no render credits.
+-- AB search from the BM25-ranked ab_catalog_fts index (searchAbCatalog in
+-- index.ts, LIKE-scan fallback). No proxy fetch, no render credits.
 --
 -- `haystack` is the folded brand + name (abHaystack — the same @grocery/core
 -- comparison fold the client matcher uses, so an indexed row matches the same
@@ -150,7 +151,8 @@ CREATE TABLE IF NOT EXISTS ab_catalog (
 -- scrape (residential IP, unblocked) crawls the whole catalog by walking the
 -- CATEGORY pages — the Products sitemap lists only URLs, so category tiles are
 -- the only bulk source of Greek names + SKUs — and the edge answers search with
--- a cheap `haystack LIKE ?` (searchSklavenitisCatalog in index.ts). No live edge
+-- the BM25-ranked sklavenitis_catalog_fts index (searchSklavenitisCatalog in
+-- index.ts, LIKE-scan fallback). No live edge
 -- egress, so the whole live-search failure tail goes away, not only the 403s.
 --
 -- DISCOVERY-ONLY: only sku/name/url/haystack are populated. Sklavenitis stays
@@ -177,3 +179,85 @@ CREATE TABLE IF NOT EXISTS sklavenitis_catalog (
     image_url   TEXT,
     indexed_at  TEXT NOT NULL DEFAULT (datetime('now'))
 );
+
+-- Full-text search indexes over the three catalogs' `haystack` columns. These
+-- exist to fix the retrieval flaw that the plain `haystack LIKE '%tok%'` scan had
+-- NO relevance ranking: it took an arbitrary `LIMIT 100` in rowid order, so a
+-- broad query (e.g. brand-only over a prolific brand) could truncate away the
+-- one row the user wanted before it was ever ranked. FTS5 ranks by BM25 (which
+-- is TF·IDF — it also gives us the corpus-derived term weighting the pairwise
+-- matcher can't), so the edge asks for the MOST RELEVANT N, not an arbitrary N.
+--
+-- EXTERNAL-CONTENT (`content='…'`): the index stores no text of its own, only
+-- postings into the base table's rowid — cheap, and the base row supplies every
+-- returned column. It MUST stay in lock-step with the base table, which is why:
+--
+--   1. The daily writer UPSERTs (INSERT … ON CONFLICT(sku) DO UPDATE), NOT
+--      INSERT OR REPLACE. REPLACE deletes+reinserts the row under a NEW rowid,
+--      and — with PRAGMA recursive_triggers OFF, which is D1's default — the
+--      REPLACE-induced DELETE does NOT fire the AFTER DELETE trigger, orphaning
+--      the old posting and corrupting the index over time. UPSERT keeps the
+--      rowid stable and fires the AFTER UPDATE trigger, which resyncs cleanly.
+--      (See scrape-local.ts — do not revert the writer to REPLACE.)
+--
+--   2. The 'rebuild' below backfills the index from rows that already existed
+--      when this migration first ran (triggers only fire on FUTURE writes), and
+--      re-runs harmlessly on every idempotent migrate, repairing any drift.
+--
+-- The tokenizer runs over the already-folded haystack, so it only has to split
+-- on whitespace/punctuation; the fold (foldHaystack / greeklish) has done the
+-- diacritic/homoglyph/iota work already. Pure cache like the base tables: safe to
+-- drop and let the next migrate 'rebuild' + next scrape repopulate. If a table is
+-- missing entirely (not migrated yet), the edge's MATCH query throws and the
+-- search helpers fall back to the LIKE scan, so search never 5xx-es.
+
+CREATE VIRTUAL TABLE IF NOT EXISTS ab_catalog_fts USING fts5(
+    haystack,
+    content='ab_catalog',
+    tokenize='unicode61 remove_diacritics 2'
+);
+CREATE TRIGGER IF NOT EXISTS ab_catalog_ai AFTER INSERT ON ab_catalog BEGIN
+    INSERT INTO ab_catalog_fts (rowid, haystack) VALUES (new.rowid, new.haystack);
+END;
+CREATE TRIGGER IF NOT EXISTS ab_catalog_ad AFTER DELETE ON ab_catalog BEGIN
+    INSERT INTO ab_catalog_fts (ab_catalog_fts, rowid, haystack) VALUES ('delete', old.rowid, old.haystack);
+END;
+CREATE TRIGGER IF NOT EXISTS ab_catalog_au AFTER UPDATE ON ab_catalog BEGIN
+    INSERT INTO ab_catalog_fts (ab_catalog_fts, rowid, haystack) VALUES ('delete', old.rowid, old.haystack);
+    INSERT INTO ab_catalog_fts (rowid, haystack) VALUES (new.rowid, new.haystack);
+END;
+INSERT INTO ab_catalog_fts (ab_catalog_fts) VALUES ('rebuild');
+
+CREATE VIRTUAL TABLE IF NOT EXISTS kritikos_catalog_fts USING fts5(
+    haystack,
+    content='kritikos_catalog',
+    tokenize='unicode61 remove_diacritics 2'
+);
+CREATE TRIGGER IF NOT EXISTS kritikos_catalog_ai AFTER INSERT ON kritikos_catalog BEGIN
+    INSERT INTO kritikos_catalog_fts (rowid, haystack) VALUES (new.rowid, new.haystack);
+END;
+CREATE TRIGGER IF NOT EXISTS kritikos_catalog_ad AFTER DELETE ON kritikos_catalog BEGIN
+    INSERT INTO kritikos_catalog_fts (kritikos_catalog_fts, rowid, haystack) VALUES ('delete', old.rowid, old.haystack);
+END;
+CREATE TRIGGER IF NOT EXISTS kritikos_catalog_au AFTER UPDATE ON kritikos_catalog BEGIN
+    INSERT INTO kritikos_catalog_fts (kritikos_catalog_fts, rowid, haystack) VALUES ('delete', old.rowid, old.haystack);
+    INSERT INTO kritikos_catalog_fts (rowid, haystack) VALUES (new.rowid, new.haystack);
+END;
+INSERT INTO kritikos_catalog_fts (kritikos_catalog_fts) VALUES ('rebuild');
+
+CREATE VIRTUAL TABLE IF NOT EXISTS sklavenitis_catalog_fts USING fts5(
+    haystack,
+    content='sklavenitis_catalog',
+    tokenize='unicode61 remove_diacritics 2'
+);
+CREATE TRIGGER IF NOT EXISTS sklavenitis_catalog_ai AFTER INSERT ON sklavenitis_catalog BEGIN
+    INSERT INTO sklavenitis_catalog_fts (rowid, haystack) VALUES (new.rowid, new.haystack);
+END;
+CREATE TRIGGER IF NOT EXISTS sklavenitis_catalog_ad AFTER DELETE ON sklavenitis_catalog BEGIN
+    INSERT INTO sklavenitis_catalog_fts (sklavenitis_catalog_fts, rowid, haystack) VALUES ('delete', old.rowid, old.haystack);
+END;
+CREATE TRIGGER IF NOT EXISTS sklavenitis_catalog_au AFTER UPDATE ON sklavenitis_catalog BEGIN
+    INSERT INTO sklavenitis_catalog_fts (sklavenitis_catalog_fts, rowid, haystack) VALUES ('delete', old.rowid, old.haystack);
+    INSERT INTO sklavenitis_catalog_fts (rowid, haystack) VALUES (new.rowid, new.haystack);
+END;
+INSERT INTO sklavenitis_catalog_fts (sklavenitis_catalog_fts) VALUES ('rebuild');

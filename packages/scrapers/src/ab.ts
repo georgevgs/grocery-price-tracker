@@ -1,5 +1,5 @@
 import type { RetailerSearchResult } from '@grocery/core/types';
-import { normalizeTitle } from '@grocery/core/normalize';
+import { foldHaystack, foldQueryTokens } from '@grocery/core/normalize';
 import { jittered, sleep } from './polite';
 import { AdapterError, toGreekFloat, type RetailerAdapter } from './types';
 
@@ -337,23 +337,21 @@ const extractTotalPages = (body: unknown): number => {
 };
 
 /**
- * The folded string an AB query's tokens are LIKE-matched against: brand + name
- * in @grocery/core's shared comparison form (normalizeTitle), so the D1 index and
- * the client-side matcher fold identically and an indexed row matches the same
- * queries the live search would.
+ * The folded string an AB query's tokens are matched against: brand + name in
+ * @grocery/core's shared retrieval fold (foldHaystack — normalizeTitle plus the
+ * iota-class collapse), so the D1 index is as spelling-tolerant as the matcher
+ * and an indexed row matches the same queries the live search would.
  */
 export const abHaystack = (brand: string | null, name: string): string =>
-  normalizeTitle(`${brand ?? ''} ${name}`.trim());
+  foldHaystack(`${brand ?? ''} ${name}`.trim());
 
 /**
  * Tokenize a query into the AND-terms matched against an AB catalog haystack.
- * Same fold as abHaystack so both sides agree; drops empty tokens. Shared by the
- * edge index query (index.ts) and this module so they tokenize identically.
+ * Same fold as abHaystack (foldQueryTokens is its query-side counterpart) so
+ * both sides agree; drops empty tokens. Shared by the edge index query
+ * (index.ts) and this module so they tokenize identically.
  */
-export const abQueryTokens = (query: string): string[] =>
-  normalizeTitle(query)
-    .split(' ')
-    .filter((token) => 0 < token.length);
+export const abQueryTokens = (query: string): string[] => foldQueryTokens(query);
 
 /** One AB product flattened for the D1 discovery index (AB carries no EAN/barcode). */
 export interface AbCatalogEntry {

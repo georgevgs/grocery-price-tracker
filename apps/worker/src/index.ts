@@ -887,6 +887,20 @@ const KRITIKOS_COLUMNS = 'sku, name, url, ean, price_piece, price_unit, unit_lab
 /** Escape LIKE metacharacters so a query token matches literally (ESCAPE '\'). */
 const escapeLike = (value: string): string => value.replace(/[\\%_]/g, (ch) => `\\${ch}`);
 
+/**
+ * Build the FTS5 MATCH expression for a set of already-folded query tokens: every
+ * token as a PREFIX term ("tok"*), AND-ed. Prefix keeps the tolerance the old
+ * `haystack LIKE '%tok%'` had on the trailing side — it still matches the fuller
+ * indexed word after the query side stripped the -σ plural — while the query now
+ * returns BM25-RANKED rows instead of an arbitrary rowid-order LIMIT. Each token
+ * is double-quote-wrapped (and internal quotes doubled) so a token that collides
+ * with an FTS keyword (AND/OR/NOT/NEAR) or carries a syntax character can't break
+ * the parse. Callers pass the SAME tokens to the LIKE fallback, so FTS and the
+ * fallback agree on what "matches".
+ */
+const ftsMatchExpr = (tokens: readonly string[]): string =>
+  tokens.map((token) => `"${token.replace(/"/g, '""')}"*`).join(' AND ');
+
 const kritikosRowToResult = (
   row: KritikosCatalogRow,
   matchedEan: string | null,
@@ -903,15 +917,65 @@ const kritikosRowToResult = (
   imageUrl: row.image_url,
 });
 
+/** Exact-EAN Kritikos rows: a barcode is identity, so these lead and bypass the
+ *  text index entirely (Kritikos's abbreviated titles often defeat token matching). */
+const kritikosByEan = async (env: Env, ean: string): Promise<RetailerSearchResult[]> => {
+  try {
+    const { results } = await env.DB.prepare(
+      `SELECT ${KRITIKOS_COLUMNS} FROM kritikos_catalog
+       WHERE barcodes LIKE ('%|' || ? || '|%') LIMIT ?`,
+    )
+      .bind(ean, KRITIKOS_MAX_RESULTS)
+      .all<KritikosCatalogRow>();
+
+    return results.map((row) => kritikosRowToResult(row, ean));
+  } catch {
+    return [];
+  }
+};
+
+/** Kritikos text rows: BM25-ranked FTS5 MATCH, falling back to the substring-AND
+ *  scan if the FTS index isn't there yet (pre-migration/reindex). */
+const searchKritikosText = async (
+  env: Env,
+  tokens: readonly string[],
+): Promise<RetailerSearchResult[]> => {
+  try {
+    const { results } = await env.DB.prepare(
+      `SELECT ${KRITIKOS_COLUMNS} FROM kritikos_catalog
+       JOIN kritikos_catalog_fts ON kritikos_catalog_fts.rowid = kritikos_catalog.rowid
+       WHERE kritikos_catalog_fts MATCH ? ORDER BY rank LIMIT ?`,
+    )
+      .bind(ftsMatchExpr(tokens), KRITIKOS_MAX_RESULTS)
+      .all<KritikosCatalogRow>();
+
+    return results.map((row) => kritikosRowToResult(row, null));
+  } catch {
+    try {
+      const clause = tokens
+        .map(() => `haystack LIKE ('%' || ? || '%') ESCAPE '\\'`)
+        .join(' AND ');
+      const { results } = await env.DB.prepare(
+        `SELECT ${KRITIKOS_COLUMNS} FROM kritikos_catalog WHERE ${clause} LIMIT ?`,
+      )
+        .bind(...tokens.map(escapeLike), KRITIKOS_MAX_RESULTS)
+        .all<KritikosCatalogRow>();
+
+      return results.map((row) => kritikosRowToResult(row, null));
+    } catch {
+      return [];
+    }
+  }
+};
+
 /**
  * Answer a Kritikos search from the D1 discovery index (built off-edge — see
  * schema.sql and scrape-local.ts) instead of downloading the live 29 MB catalog
  * on the edge. An EAN hint matches exactly against the pipe-delimited barcodes
- * and ranks first (a barcode is identity — Kritikos's abbreviated titles often
- * defeat token matching); each text token becomes a `haystack LIKE ?` AND-term,
- * mirroring the live adapter's every-token substring rule. Best-effort: if the
- * table is missing (not migrated yet) or the query errors, return no results
- * rather than failing — this path must never 5xx (that was the whole problem).
+ * and ranks first; text tokens go through the BM25-ranked FTS5 index
+ * (kritikos_catalog_fts) so a broad query gets the MOST RELEVANT rows, not an
+ * arbitrary rowid-order LIMIT. Best-effort throughout: a missing table or query
+ * error yields no results rather than a 5xx (that was the whole point).
  */
 const searchKritikosCatalog = async (
   env: Env,
@@ -925,42 +989,13 @@ const searchKritikosCatalog = async (
     return [];
   }
 
-  try {
-    const exact: RetailerSearchResult[] = [];
+  const exact = hasEan && undefined !== ean ? await kritikosByEan(env, ean) : [];
+  const text = 0 < tokens.length ? await searchKritikosText(env, tokens) : [];
 
-    if (hasEan && undefined !== ean) {
-      const { results } = await env.DB.prepare(
-        `SELECT ${KRITIKOS_COLUMNS} FROM kritikos_catalog
-         WHERE barcodes LIKE ('%|' || ? || '|%') LIMIT ?`,
-      )
-        .bind(ean, KRITIKOS_MAX_RESULTS)
-        .all<KritikosCatalogRow>();
+  // Exact-EAN matches lead; drop any text row that duplicates one.
+  const seen = new Set(exact.map((result) => result.sku));
 
-      exact.push(...results.map((row) => kritikosRowToResult(row, ean)));
-    }
-
-    const text: RetailerSearchResult[] = [];
-
-    if (0 < tokens.length) {
-      const clause = tokens
-        .map(() => `haystack LIKE ('%' || ? || '%') ESCAPE '\\'`)
-        .join(' AND ');
-      const { results } = await env.DB.prepare(
-        `SELECT ${KRITIKOS_COLUMNS} FROM kritikos_catalog WHERE ${clause} LIMIT ?`,
-      )
-        .bind(...tokens.map(escapeLike), KRITIKOS_MAX_RESULTS)
-        .all<KritikosCatalogRow>();
-
-      text.push(...results.map((row) => kritikosRowToResult(row, null)));
-    }
-
-    // Exact-EAN matches lead; drop any text row that duplicates one.
-    const seen = new Set(exact.map((result) => result.sku));
-
-    return [...exact, ...text.filter((result) => false === seen.has(result.sku))];
-  } catch {
-    return [];
-  }
+  return [...exact, ...text.filter((result) => false === seen.has(result.sku))];
 };
 
 interface AbCatalogRow {
@@ -992,11 +1027,12 @@ const abRowToResult = (row: AbCatalogRow): RetailerSearchResult => ({
 
 /**
  * Answer an AB search from the D1 discovery index (built off-edge — schema.sql,
- * scrape-local.ts) instead of the paid Scrape.do render path. Each query token
- * becomes a `haystack LIKE ?` AND-term (same fold as the client matcher, via the
- * shared abQueryTokens), mirroring searchKritikosCatalog. AB carries no barcode,
- * so there is no EAN branch. Best-effort: a missing table (not migrated) or any
- * query error returns [] so this path never 5xx-es.
+ * scrape-local.ts) instead of the paid Scrape.do render path. Query tokens go
+ * through the BM25-ranked FTS5 index (ab_catalog_fts) so a broad query returns
+ * the most relevant rows, not an arbitrary rowid-order LIMIT; if that index
+ * isn't there yet (pre-migration/reindex) it falls back to the substring-AND
+ * scan. AB carries no barcode, so there is no EAN branch. Best-effort: a missing
+ * table or query error returns [] so this path never 5xx-es.
  */
 const searchAbCatalog = async (
   env: Env,
@@ -1009,18 +1045,30 @@ const searchAbCatalog = async (
   }
 
   try {
-    const clause = tokens
-      .map(() => `haystack LIKE ('%' || ? || '%') ESCAPE '\\'`)
-      .join(' AND ');
     const { results } = await env.DB.prepare(
-      `SELECT ${AB_COLUMNS} FROM ab_catalog WHERE ${clause} LIMIT ?`,
+      `SELECT ${AB_COLUMNS} FROM ab_catalog
+       JOIN ab_catalog_fts ON ab_catalog_fts.rowid = ab_catalog.rowid
+       WHERE ab_catalog_fts MATCH ? ORDER BY rank LIMIT ?`,
     )
-      .bind(...tokens.map(escapeLike), AB_MAX_RESULTS)
+      .bind(ftsMatchExpr(tokens), AB_MAX_RESULTS)
       .all<AbCatalogRow>();
 
     return results.map(abRowToResult);
   } catch {
-    return [];
+    try {
+      const clause = tokens
+        .map(() => `haystack LIKE ('%' || ? || '%') ESCAPE '\\'`)
+        .join(' AND ');
+      const { results } = await env.DB.prepare(
+        `SELECT ${AB_COLUMNS} FROM ab_catalog WHERE ${clause} LIMIT ?`,
+      )
+        .bind(...tokens.map(escapeLike), AB_MAX_RESULTS)
+        .all<AbCatalogRow>();
+
+      return results.map(abRowToResult);
+    } catch {
+      return [];
+    }
   }
 };
 
@@ -1072,18 +1120,30 @@ const searchSklavenitisCatalog = async (
   }
 
   try {
-    const clause = tokens
-      .map(() => `haystack LIKE ('%' || ? || '%') ESCAPE '\\'`)
-      .join(' AND ');
     const { results } = await env.DB.prepare(
-      `SELECT ${SKLAVENITIS_COLUMNS} FROM sklavenitis_catalog WHERE ${clause} LIMIT ?`,
+      `SELECT ${SKLAVENITIS_COLUMNS} FROM sklavenitis_catalog
+       JOIN sklavenitis_catalog_fts ON sklavenitis_catalog_fts.rowid = sklavenitis_catalog.rowid
+       WHERE sklavenitis_catalog_fts MATCH ? ORDER BY rank LIMIT ?`,
     )
-      .bind(...tokens.map(escapeLike), SKLAVENITIS_MAX_RESULTS)
+      .bind(ftsMatchExpr(tokens), SKLAVENITIS_MAX_RESULTS)
       .all<SklavenitisCatalogRow>();
 
     return results.map(sklavenitisRowToResult);
   } catch {
-    return [];
+    try {
+      const clause = tokens
+        .map(() => `haystack LIKE ('%' || ? || '%') ESCAPE '\\'`)
+        .join(' AND ');
+      const { results } = await env.DB.prepare(
+        `SELECT ${SKLAVENITIS_COLUMNS} FROM sklavenitis_catalog WHERE ${clause} LIMIT ?`,
+      )
+        .bind(...tokens.map(escapeLike), SKLAVENITIS_MAX_RESULTS)
+        .all<SklavenitisCatalogRow>();
+
+      return results.map(sklavenitisRowToResult);
+    } catch {
+      return [];
+    }
   }
 };
 

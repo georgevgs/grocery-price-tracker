@@ -249,6 +249,34 @@ export const stemFold = (normalizedToken: string): string => {
 };
 
 /**
+ * The fold applied to INDEXED catalog text (the D1 `haystack` column) so that
+ * discovery tolerates the same spelling variance the matcher does. Historically
+ * the haystack was only normalizeTitle'd (diacritics + homoglyphs), which left
+ * retrieval STRICTER than the matcher: the matcher equates Φυστίκια/Φιστίκια via
+ * foldForComparison, but the substring index did not, so a product the ranker
+ * would happily match could be un-retrievable. Folding the iota-class here (and
+ * the query, via foldQueryTokens) closes that asymmetry. Substring (LIKE) and
+ * prefix (FTS5) matching then absorb the plural/case (-σ) endings the query side
+ * strips. The output is internal — it feeds the index and the edge query, never
+ * the UI.
+ */
+export const foldHaystack = (raw: string): string => foldForComparison(normalizeTitle(raw));
+
+/**
+ * Fold a free-text query into the AND-terms matched against a foldHaystack()
+ * string — the query-side counterpart of foldHaystack, one class tighter (it
+ * also strips the -σ ending via stemFold, which substring/prefix matching then
+ * re-tolerates against the fuller indexed form). Drops tokens that fold away
+ * (punctuation-only). Shared by every catalog chain so the index and the edge
+ * query fold identically.
+ */
+export const foldQueryTokens = (query: string): string[] =>
+  normalizeTitle(query)
+    .split(' ')
+    .filter((token) => 0 < token.length)
+    .map((token) => stemFold(token));
+
+/**
  * The Greek letters with no Latin homoglyph (so the homoglyph fold leaves
  * them Greek), mapped to a phonetic Latin equivalent. Cross-script brand
  * matching needs this: a product's brand may be stored "ΦΑΓΕ"/"ΝΕΣΚΑΦΕ"

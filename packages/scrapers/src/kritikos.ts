@@ -1,4 +1,5 @@
 import type { RetailerSearchResult, ScrapedListing } from '@grocery/core/types';
+import { foldForComparison } from '@grocery/core/normalize';
 import { AdapterError, type RetailerAdapter } from './types';
 
 const BASE_URL = 'https://kritikos-sm.gr';
@@ -238,18 +239,20 @@ const toUnitLabel = (raw: unknown): string | null => {
 export const buildHaystack = (product: JsonObject): string => {
   const searchTerms = isObject(product['searchTerms']) ? product['searchTerms'] : {};
 
-  return [
-    searchTerms['name'],
-    searchTerms['brand'],
-    searchTerms['type'],
-    searchTerms['categoryKind'],
-    searchTerms['categories'],
-    searchTerms['reduced'],
-    searchTerms['sku'],
-  ]
-    .filter((value): value is string => 'string' === typeof value)
-    .join(' ')
-    .toLowerCase();
+  return foldForComparison(
+    [
+      searchTerms['name'],
+      searchTerms['brand'],
+      searchTerms['type'],
+      searchTerms['categoryKind'],
+      searchTerms['categories'],
+      searchTerms['reduced'],
+      searchTerms['sku'],
+    ]
+      .filter((value): value is string => 'string' === typeof value)
+      .join(' ')
+      .toLowerCase(),
+  );
 };
 
 const matchesSearchTerms = (product: JsonObject, tokens: readonly string[]): boolean => {
@@ -268,7 +271,11 @@ const matchesSearchTerms = (product: JsonObject, tokens: readonly string[]): boo
 export const queryTokens = (query: string): string[] => {
   return transliterate(query)
     .split(/\s+/)
-    .filter((token) => /[a-z0-9]/.test(token));
+    .filter((token) => /[a-z0-9]/.test(token))
+    // Collapse the iota-class (η/υ → i, etc.) on both the query and the haystack
+    // (buildHaystack) so retrieval tolerates the same spelling variance the
+    // matcher does — a row the ranker would match is no longer un-retrievable.
+    .map((token) => foldForComparison(token));
 };
 
 const mapSearchResult = (

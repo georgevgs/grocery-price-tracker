@@ -1,5 +1,5 @@
 import type { RetailerSearchResult, ScrapedListing } from '@grocery/core/types';
-import { normalizeTitle } from '@grocery/core/normalize';
+import { foldHaystack, foldQueryTokens } from '@grocery/core/normalize';
 import { jittered, sleep } from './polite';
 import { AdapterError, toGreekFloat, type RetailerAdapter } from './types';
 
@@ -265,24 +265,22 @@ const CATEGORY_SITEMAP_INDEX = `${BASE_URL}/sitemap/ProductCategories/sitemap_in
 const LOC_PATTERN = /<loc>([^<]+)<\/loc>/g;
 
 /**
- * The folded string a query's tokens are LIKE-matched against. Sklavenitis
- * search yields no separate brand field, but the tile title already leads with
- * the brand, so the name alone — run through @grocery/core's shared
- * normalizeTitle, exactly as abHaystack does — is the whole haystack. Same fold
- * as the client matcher, so an indexed row matches the same queries live search
- * would.
+ * The folded string a query's tokens are matched against. Sklavenitis search
+ * yields no separate brand field, but the tile title already leads with the
+ * brand, so the name alone — run through @grocery/core's shared retrieval fold
+ * (foldHaystack — normalizeTitle plus the iota-class collapse), exactly as
+ * abHaystack does — is the whole haystack. Same fold as the client matcher, so
+ * an indexed row matches the same queries live search would.
  */
-export const sklavenitisHaystack = (name: string): string => normalizeTitle(name);
+export const sklavenitisHaystack = (name: string): string => foldHaystack(name);
 
 /**
  * Tokenize a query into the AND-terms matched against a catalog haystack — same
- * fold as sklavenitisHaystack so both sides agree. Shared by the edge index
- * query (index.ts) and this module so they tokenize identically.
+ * fold as sklavenitisHaystack (foldQueryTokens is its query-side counterpart) so
+ * both sides agree. Shared by the edge index query (index.ts) and this module so
+ * they tokenize identically.
  */
-export const sklavenitisQueryTokens = (query: string): string[] =>
-  normalizeTitle(query)
-    .split(' ')
-    .filter((token) => 0 < token.length);
+export const sklavenitisQueryTokens = (query: string): string[] => foldQueryTokens(query);
 
 /** One Sklavenitis product flattened for the D1 discovery index (no EAN/price). */
 export interface SklavenitisCatalogEntry {

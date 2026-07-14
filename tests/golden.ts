@@ -92,6 +92,20 @@ export const GOLDEN_CASES: readonly GoldenCase[] = [
     shouldMatch: true,
     note: 'extractPercent must read the fat 3,5%, not the leading promo -20%',
   },
+  {
+    name: 'synonym: στραγγιστό ≡ στραγγισμένο (would miss without the alias)',
+    product: { title: 'Γιαούρτι Στραγγιστό', brand: 'ΦΑΓΕ' },
+    result: { title: 'ΦΑΓΕ Γιαούρτι Στραγγισμένο', brand: null },
+    shouldMatch: true,
+    note: 'synonym table: too far apart for the fold/edit-distance; sizeless + generic γιαούρτι drops it to 0.41 (< threshold) without the alias',
+  },
+  {
+    name: 'synonym: ανθρακούχο ≡ αεριούχο (carbonated water)',
+    product: { title: 'Νερό Μεταλλικό Ανθρακούχο 1lt', brand: 'ΣΟΥΡΩΤΗ' },
+    result: { title: 'ΣΟΥΡΩΤΗ Νερό Μεταλλικό Αεριούχο 1lt', brand: null },
+    shouldMatch: true,
+    note: 'synonym table guard: the two carbonation words name the same attribute',
+  },
 
   // --- adversarial negatives ---------------------------------------------
   {
@@ -135,6 +149,20 @@ export const GOLDEN_CASES: readonly GoldenCase[] = [
     result: { title: 'ΟΛΥΜΠΟΣ Γάλα Αγελαδινό 1lt', brand: null },
     shouldMatch: false,
     note: 'variant-attribute gate: different members of the milk-source class',
+  },
+  {
+    name: 'variant contradiction: buffalo milk vs cow milk',
+    product: { title: 'Γάλα Βουβαλίσιο 1lt', brand: 'ΟΛΥΜΠΟΣ' },
+    result: { title: 'ΟΛΥΜΠΟΣ Γάλα Αγελαδινό 1lt', brand: null },
+    shouldMatch: false,
+    note: 'variant-attribute gate: βουβαλίσιο is a fourth milk-source group',
+  },
+  {
+    name: 'variant contradiction: ground coffee vs whole beans',
+    product: { title: 'Καφές Espresso Αλεσμένος 250g', brand: 'ΛΟΥΜΙΔΗΣ' },
+    result: { title: 'ΛΟΥΜΙΔΗΣ Καφές Espresso Κόκκοι 250g', brand: null },
+    shouldMatch: false,
+    note: 'variant-attribute gate: ground/beans are different shelf products despite same brand+size+espresso',
   },
   {
     name: 'brand substring: ΒΙΟ inside Βιολογικό',

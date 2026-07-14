@@ -56,19 +56,45 @@ const STOPWORDS = buildFoldedSet(['με', 'και', 'σε', 'για', 'από', 
 // …and category nouns/adjectives appear in half the aisle: two different
 // milks share γάλα/φρέσκο/ελληνικό, so those tokens must not be able to
 // carry a match on their own.
+//
+// This is a hand-curated stand-in for corpus IDF: a term this common carries
+// little identity, which IDF would learn automatically from term frequency.
+// The pairwise matcher has no corpus at score time (it ranks one scraped title
+// against one target) and its 0.45/0.8 thresholds are calibrated to the current
+// score scale, so injecting live IDF here would destabilise them — instead the
+// list is kept category-AGNOSTIC (not just dairy) so precision generalises past
+// the golden set's aisles, and true corpus IDF is applied where a corpus does
+// exist: the FTS5/BM25 retrieval layer (see searchAbCatalog et al. in the
+// worker), whose ranking already weights rare query terms above common ones.
 const GENERIC_TOKENS = buildFoldedSet([
+  // dairy
   'γάλα',
   'φρέσκο',
   'φρέσκια',
+  'λιπαρά',
+  // category nouns — generic WITHIN their aisle, exactly like γάλα is among milks
+  'τυρί',
+  'γιαούρτι',
+  'χυμός',
+  'νερό',
+  'καφές',
+  'ψωμί',
+  'αναψυκτικό',
+  'δημητριακά',
+  'μπισκότα',
+  'σνακ',
+  'ρόφημα',
+  // provenance / marketing adjectives that decorate half the shelf
   'ελληνικό',
   'ελληνική',
   'παραδοσιακό',
   'παραδοσιακή',
   'κλασικό',
   'κλασική',
+  'βιολογικό',
+  'βιολογική',
   'νέο',
   'extra',
-  'λιπαρά',
 ]);
 
 /**
@@ -85,13 +111,55 @@ const VARIANT_CLASSES: readonly (readonly ReadonlySet<string>[])[] = [
     buildFoldedSet(['ελαφρύ', 'ελαφρύς', 'light']),
     buildFoldedSet(['άπαχο', 'άπαχη']),
   ],
-  // milk source
+  // milk source — buffalo/βουβαλίσιο is a fourth mutually-exclusive animal
   [
     buildFoldedSet(['αγελαδινό']),
     buildFoldedSet(['κατσικίσιο', 'γίδινο']),
     buildFoldedSet(['πρόβειο']),
+    buildFoldedSet(['βουβαλίσιο']),
+  ],
+  // coffee physical form — ground vs whole-bean vs instant are three different
+  // shelf products (only the reliably-labelled forms; roast/brew words like
+  // espresso/φίλτρου co-occur with a grind, so they are NOT gated here).
+  [
+    buildFoldedSet(['αλεσμένος', 'αλεσμένο']),
+    buildFoldedSet(['κόκκοι', 'κόκκος', 'κόκκων']),
+    buildFoldedSet(['στιγμιαίος', 'στιγμιαίο', 'instant']),
   ],
 ];
+
+/**
+ * Synonym groups: DIFFERENT words that name the SAME thing, so two titles using
+ * one each are describing one product. This is the identity-PRESERVING mirror of
+ * VARIANT_CLASSES (which is identity-BREAKING): members here are made equivalent
+ * at scoring time (tokensEquivalent), members there are made contradictory.
+ *
+ * The fold (foldForComparison) and edit-distance-1 already bridge spelling and
+ * one-character variants — Φυστίκια/Φιστίκια, single-λ/double-λ — so this table
+ * is ONLY for lexical synonyms too far apart for those (a whole different stem,
+ * or a loanword). Grocery synonyms are treacherous for precision (λάδι is NOT
+ * ελαιόλαδο — sunflower oil ≠ olive oil), so the seed is deliberately tiny and
+ * only truly interchangeable pairs; it is meant to grow from observed real
+ * misses, the way Skroutz curates its manufacturer aliases. Every addition must
+ * ship with a golden case.
+ */
+const SYNONYM_GROUPS: readonly ReadonlySet<string>[] = [
+  // strained yogurt — both participles are used interchangeably on shelf
+  buildFoldedSet(['στραγγιστό', 'στραγγισμένο']),
+  // carbonated — ανθρακούχο and αεριούχο are the same attribute
+  buildFoldedSet(['ανθρακούχο', 'αεριούχο', 'ανθρακούχα', 'αεριούχα']),
+];
+
+/** True when both folded tokens name the same thing via a SYNONYM_GROUPS entry. */
+const synonymsEquivalent = (a: string, b: string): boolean => {
+  for (const group of SYNONYM_GROUPS) {
+    if (true === group.has(a) && true === group.has(b)) {
+      return true;
+    }
+  }
+
+  return false;
+};
 
 /**
  * Suggest which existing products a scraped title likely refers to.
@@ -324,6 +392,12 @@ const weightedFuzzyJaccard = (
 
 const tokensEquivalent = (a: WeightedToken, b: WeightedToken): boolean => {
   if (a.token === b.token || a.folded === b.folded) {
+    return true;
+  }
+
+  // Lexical synonyms the fold/edit-distance can't bridge (στραγγιστό ≡
+  // στραγγισμένο). Checked before the digit guard because synonyms are words.
+  if (true === synonymsEquivalent(a.folded, b.folded)) {
     return true;
   }
 

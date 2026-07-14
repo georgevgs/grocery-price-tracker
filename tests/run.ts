@@ -55,6 +55,7 @@ import {
 } from '../apps/web/src/lib/matching';
 import type { RetailerId, RetailerSearchResult } from '../packages/core/src/types';
 import { evaluateGoldenSet, formatGoldenReport } from './golden';
+import { evaluateRetrievalSet, formatRetrievalReport } from './retrieval-golden';
 
 // --- normalize ---------------------------------------------------------
 
@@ -1353,6 +1354,26 @@ assert.ok(
 assert.ok(
   GOLDEN_RECALL_FLOOR <= goldenMetrics.recall,
   `golden recall ${goldenMetrics.recall.toFixed(3)} fell below floor ${GOLDEN_RECALL_FLOOR}`,
+);
+
+// --- golden retrieval set --------------------------------------------------
+// Recall/precision of DISCOVERY (tests/retrieval-golden.ts): does a chain's
+// tokenizer + D1 haystack actually surface the target row? golden.ts above only
+// tests the ranker once the row is in hand; this guards the fold that makes a
+// matchable product retrievable. Same all-or-nothing ratchet.
+const RETRIEVAL_PRECISION_FLOOR = 1;
+const RETRIEVAL_RECALL_FLOOR = 1;
+
+const retrievalMetrics = evaluateRetrievalSet();
+console.log(formatRetrievalReport(retrievalMetrics));
+
+assert.ok(
+  RETRIEVAL_PRECISION_FLOOR <= retrievalMetrics.precision,
+  `retrieval precision ${retrievalMetrics.precision.toFixed(3)} fell below floor ${RETRIEVAL_PRECISION_FLOOR}`,
+);
+assert.ok(
+  RETRIEVAL_RECALL_FLOOR <= retrievalMetrics.recall,
+  `retrieval recall ${retrievalMetrics.recall.toFixed(3)} fell below floor ${RETRIEVAL_RECALL_FLOOR}`,
 );
 
 console.log('ALL TESTS PASSED');
