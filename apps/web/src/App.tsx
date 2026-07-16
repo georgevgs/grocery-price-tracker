@@ -6,6 +6,7 @@ import { RETAILER_LABELS } from './lib/matching';
 import type { ResultSort, View } from './lib/format';
 import { Header } from './components/Header';
 import { BottomNav } from './components/BottomNav';
+import { OfflineBanner } from './components/OfflineBanner';
 import { Footer } from './components/Footer';
 import { AddProductForm } from './components/AddProductForm';
 import { HomeView } from './views/HomeView';
@@ -226,6 +227,8 @@ export const App = () => {
       <Footer />
 
       <BottomNav view={view} onNavigate={setView} onAdd={() => setView('add')} />
+
+      <OfflineBanner />
     </div>
   );
 };
